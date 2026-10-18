@@ -99,6 +99,8 @@ extern int string_tolong(const char *str, long *l);
 #define DEFAULT_REQ_PER_COMMAND 500
 #define MAX_REQ_PER_COMMAND 10000
 
+#define DEFAULT_PROBE_METHOD "icmp-echo"
+
 #define CMD_BUF_LEN (256 + (MAX_REQ_PER_COMMAND * (INET_ADDRSTRLEN + 1)))
 
 #define TV_TO_MS(timeval) ((timeval.tv_sec * (uint64_t)1000) + timeval.tv_usec)
@@ -113,6 +115,9 @@ typedef struct scamper_driver {
   uint16_t port;
   // unix socket for remote controlled scamper
   char *unix_socket;
+  // radargun probe method (scamper -P) and destination port (-d, 0 = unset)
+  char *probe_method;
+  uint16_t probe_dport;
 
   // list of queued requests
   trinarkular_probe_req_t req_queue[REQ_QUEUE_LEN];
@@ -269,6 +274,7 @@ static int send_req(trinarkular_driver_t *drv)
 {
   trinarkular_probe_req_t *req;
   char cmd[CMD_BUF_LEN];
+  char probedef[64];
   size_t len;
   int targets_added = 0;
 
@@ -283,10 +289,16 @@ static int send_req(trinarkular_driver_t *drv)
   // build scamper command (grab the config from the first request)
   req = &MY(drv)->req_queue[MY(drv)->req_queue_next_idx];
   wait = req->wait;
+  if (MY(drv)->probe_dport != 0) {
+    snprintf(probedef, sizeof(probedef), "-P %s -d %u", MY(drv)->probe_method,
+             MY(drv)->probe_dport);
+  } else {
+    snprintf(probedef, sizeof(probedef), "-P %s", MY(drv)->probe_method);
+  }
   if ((len =
-         snprintf(cmd, CMD_BUF_LEN, "dealias -m radargun -p \"-P icmp-echo\" "
+         snprintf(cmd, CMD_BUF_LEN, "dealias -m radargun -p \"%s\" "
                                     "-w %d -q 1 -W 1",
-                  wait)) >= CMD_BUF_LEN) {
+                  probedef, wait)) >= CMD_BUF_LEN) {
     trinarkular_log("ERROR: Could not build scamper command");
     return -1;
   }
@@ -541,9 +553,12 @@ static void usage(char *name)
     stderr,
     "Driver usage: %s [options] [-p|-R]\n"
     "       -b <cnt>       batch size for radargun batches (default: %d)\n"
+    "       -d <dport>     destination port for TCP/UDP probe methods\n"
+    "       -m <method>    radargun probe method, e.g. tcp-syn-sport "
+    "(default: %s)\n"
     "       -p <port>      port to find scamper on\n"
     "       -R <unix>      unix domain socket for remote controlled scamper\n",
-    name, DEFAULT_REQ_PER_COMMAND);
+    name, DEFAULT_REQ_PER_COMMAND, DEFAULT_PROBE_METHOD);
 }
 
 static int parse_args(trinarkular_driver_t *drv, int argc, char **argv)
@@ -554,7 +569,7 @@ static int parse_args(trinarkular_driver_t *drv, int argc, char **argv)
   int port_set = 0;
 
   optind = 1;
-  while (prevoptind = optind, (opt = getopt(argc, argv, ":b:p:R:?")) >= 0) {
+  while (prevoptind = optind, (opt = getopt(argc, argv, ":b:d:m:p:R:?")) >= 0) {
     if (optind == prevoptind + 2 && optarg && *optarg == '-' &&
         *(optarg + 1) != '\0') {
       opt = ':';
@@ -563,6 +578,16 @@ static int parse_args(trinarkular_driver_t *drv, int argc, char **argv)
     switch (opt) {
     case 'b':
       MY(drv)->req_per_command = strtoul(optarg, NULL, 10);
+      break;
+
+    case 'd':
+      MY(drv)->probe_dport = strtoul(optarg, NULL, 10);
+      break;
+
+    case 'm':
+      free(MY(drv)->probe_method);
+      MY(drv)->probe_method = strdup(optarg);
+      assert(MY(drv)->probe_method != NULL);
       break;
 
     case 'p':
@@ -636,6 +661,8 @@ int trinarkular_driver_scamper_init(trinarkular_driver_t *drv, int argc,
   int typec = 1;
 
   MY(drv)->req_per_command = DEFAULT_REQ_PER_COMMAND;
+  MY(drv)->probe_method = strdup(DEFAULT_PROBE_METHOD);
+  assert(MY(drv)->probe_method != NULL);
 
   if (parse_args(drv, argc, argv) != 0) {
     return -1;
@@ -728,6 +755,7 @@ void trinarkular_driver_scamper_destroy(trinarkular_driver_t *drv)
   }
 
   free(MY(drv)->unix_socket);
+  free(MY(drv)->probe_method);
   MY(drv)->unix_socket = NULL;
 }
 
