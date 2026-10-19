@@ -1159,6 +1159,7 @@ static int handle_timer(zloop_t *loop, int timer_id, void *arg)
   trinarkular_slash24_state_t *state = NULL; // BORROWED
   trinarkular_signal_state_t *sig_state;     // BORROWED
   int proto;
+  int probe_proto_cnt;
 
   CHECK_SHUTDOWN;
 
@@ -1219,8 +1220,14 @@ static int handle_timer(zloop_t *loop, int timer_id, void *arg)
   // check if there are still a few slices of probes outstanding.  this is a
   // good indication that scamper is not keeping up with the probing rate
   // (probably due to our timers firing close together).  in this case we skip
-  // the entire slice.
-  if (prober->outstanding_probe_cnt > prober->slice_size * 5) {
+  // the entire slice. (each /24 gets a periodic probe per protocol, so the
+  // limit scales with the number of protocols probed)
+  probe_proto_cnt = 0;
+  for (proto = 0; proto < TRINARKULAR_PROBE_PROTO_CNT; proto++) {
+    probe_proto_cnt += HAS_SIGNAL(ACTIVE_SIGNALS(prober), proto) ? 1 : 0;
+  }
+  if (prober->outstanding_probe_cnt >
+      prober->slice_size * 5 * probe_proto_cnt) {
     trinarkular_log(
       "WARN: %d outstanding requests (slice size is %d), skipping slice.",
       prober->outstanding_probe_cnt, prober->slice_size);
