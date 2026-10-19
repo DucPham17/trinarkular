@@ -115,6 +115,8 @@ int trinarkular_probe_req_send(void *dst, trinarkular_probe_req_t *req)
   size_t written = 0;
   size_t s;
 
+  uint16_t u16;
+
   // send the command type ("REQ")
   if (zmq_send(dst, "REQ", strlen("REQ"), ZMQ_SNDMORE) != strlen("REQ")) {
     trinarkular_log("ERROR: Could not send request command");
@@ -128,6 +130,11 @@ int trinarkular_probe_req_send(void *dst, trinarkular_probe_req_t *req)
 
   // wait
   SERIALIZE_VAL(req->wait);
+
+  // protocol and port
+  SERIALIZE_VAL(req->proto);
+  u16 = htons(req->port);
+  SERIALIZE_VAL(u16);
 
   // send the buffer
   if (zmq_send(dst, buf, written, 0) != written) {
@@ -165,6 +172,11 @@ int trinarkular_probe_req_recv(void *src, trinarkular_probe_req_t *req)
   // wait
   DESERIALIZE_VAL(req->wait);
 
+  // protocol and port
+  DESERIALIZE_VAL(req->proto);
+  DESERIALIZE_VAL(req->port);
+  req->port = ntohs(req->port);
+
   return 0;
 
 err:
@@ -180,6 +192,7 @@ int trinarkular_probe_resp_send(void *dst, trinarkular_probe_resp_t *resp)
   size_t s;
 
   uint32_t u32;
+  uint16_t u16;
 
   // send the command type ("RESP")
   if (zmq_send(dst, "RESP", strlen("RESP"), ZMQ_SNDMORE) != strlen("RESP")) {
@@ -199,6 +212,11 @@ int trinarkular_probe_resp_send(void *dst, trinarkular_probe_resp_t *resp)
 
   SERIALIZE_VAL(resp->probes_sent);
   SERIALIZE_VAL(resp->probes_replied);
+
+  // protocol and port
+  SERIALIZE_VAL(resp->proto);
+  u16 = htons(resp->port);
+  SERIALIZE_VAL(u16);
 
   // send the buffer
   if (zmq_send(dst, buf, written, 0) != written) {
@@ -240,6 +258,11 @@ int trinarkular_probe_resp_recv(void *src, trinarkular_probe_resp_t *resp)
 
   DESERIALIZE_VAL(resp->probes_sent);
   DESERIALIZE_VAL(resp->probes_replied);
+
+  // protocol and port
+  DESERIALIZE_VAL(resp->proto);
+  DESERIALIZE_VAL(resp->port);
+  resp->port = ntohs(resp->port);
 
   return 0;
 

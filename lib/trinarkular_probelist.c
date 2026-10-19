@@ -52,6 +52,7 @@
 #include <assert.h>
 #include <netinet/in.h>
 #include <stdio.h>
+#include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <wandio.h>
@@ -76,6 +77,9 @@ struct trinarkular_probelist {
   /** Index of the current /24 */
   int slash24_iter;
 
+  /** Signals provided (see trinarkular_probelist_get_signals) */
+  uint8_t signals;
+
   /** Buffer for deserializing /24s into */
   // trinarkular_slash24_t slash24;
 
@@ -98,12 +102,9 @@ static int copy_state(trinarkular_slash24_state_t *to,
 {
   int i;
 
-  to->current_host = from->current_host;
-  to->last_probe_type = from->last_probe_type;
-  to->probe_budget = from->probe_budget;
-  to->current_belief = from->current_belief;
-  to->current_state = from->current_state;
-  to->rounds_since_up = from->rounds_since_up;
+  for (i = 0; i < TRINARKULAR_SIGNAL_CNT; i++) {
+    to->sig[i] = from->sig[i];
+  }
   to->cumulative_rtt = from->cumulative_rtt;
   to->probes_sent = from->probes_sent;
   to->replies_seen = from->replies_seen;
@@ -114,12 +115,13 @@ static int copy_state(trinarkular_slash24_state_t *to,
   // realloc metrics array
   if ((to->metrics =
          realloc(to->metrics, sizeof(trinarkular_slash24_metrics_t) *
-                                from->metrics_cnt)) == NULL) {
+                                from->metrics_cnt * TRINARKULAR_SIGNAL_CNT)) ==
+      NULL) {
     return -1;
   }
 
   // copy metrics
-  for (i = 0; i < from->metrics_cnt; i++) {
+  for (i = 0; i < from->metrics_cnt * TRINARKULAR_SIGNAL_CNT; i++) {
     to->metrics[i] = from->metrics[i];
   }
 
@@ -138,20 +140,52 @@ static void free_state(trinarkular_slash24_state_t *state)
   state->metrics = 0;
 }
 
-static int add_host(trinarkular_slash24_t *s24, uint32_t host_ip)
+static int add_host(trinarkular_slash24_t *s24, int proto, uint32_t host_ip,
+                    uint16_t port)
 {
+  trinarkular_slash24_hosts_t *h = &s24->proto[proto];
+
   assert((host_ip & TRINARKULAR_SLASH24_NETMASK) == s24->network_ip);
 
   uint8_t host_byte = host_ip & TRINARKULAR_SLASH24_HOSTMASK;
 
-  if ((s24->hosts =
-         realloc(s24->hosts, sizeof(uint8_t) * (s24->hosts_cnt + 1))) == NULL) {
+  if ((h->hosts = realloc(h->hosts, sizeof(uint8_t) * (h->hosts_cnt + 1))) ==
+      NULL) {
     return -1;
   }
+  h->hosts[h->hosts_cnt] = host_byte;
 
-  s24->hosts[s24->hosts_cnt++] = host_byte;
+  if (proto != TRINARKULAR_PROBE_PROTO_ICMP) {
+    if ((h->ports = realloc(h->ports, sizeof(uint16_t) * (h->hosts_cnt + 1))) ==
+        NULL) {
+      return -1;
+    }
+    h->ports[h->hosts_cnt] = port;
+  }
+
+  h->hosts_cnt++;
 
   return 0;
+}
+
+/** Shuffle a protocol's hosts, keeping each host with its port */
+static void shuffle_hosts(trinarkular_slash24_hosts_t *h)
+{
+  int i, r;
+  uint8_t host;
+  uint16_t port;
+
+  for (i = h->hosts_cnt - 1; i > 0; i--) {
+    r = rand() % (i + 1);
+    host = h->hosts[i];
+    h->hosts[i] = h->hosts[r];
+    h->hosts[r] = host;
+    if (h->ports != NULL) {
+      port = h->ports[i];
+      h->ports[i] = h->ports[r];
+      h->ports[r] = port;
+    }
+  }
 }
 
 static int add_metadata(trinarkular_slash24_t *s24, char *md)
@@ -207,9 +241,7 @@ static trinarkular_slash24_t *add_slash24(trinarkular_probelist_t *pl,
   s24 = &kh_val(pl->s24_hash, k);
 
   s24->network_ip = network_ip;
-  s24->hosts = NULL;
-  s24->hosts_cnt = 0;
-  s24->aeb = 0;
+  memset(s24->proto, 0, sizeof(s24->proto));
   s24->md = NULL;
   s24->md_cnt = 0;
 
@@ -225,9 +257,13 @@ static void free_slash24(trinarkular_slash24_t *s24)
     return;
   }
 
-  free(s24->hosts);
-  s24->hosts = NULL;
-  s24->hosts_cnt = 0;
+  for (i = 0; i < TRINARKULAR_PROBE_PROTO_CNT; i++) {
+    free(s24->proto[i].hosts);
+    s24->proto[i].hosts = NULL;
+    free(s24->proto[i].ports);
+    s24->proto[i].ports = NULL;
+    s24->proto[i].hosts_cnt = 0;
+  }
 
   for (i = 0; i < s24->md_cnt; i++) {
     free(s24->md[i]);
@@ -248,14 +284,16 @@ destroy_slash24(trianrkular_slash24_t *s24)
 #endif
 
 static jsmntok_t *process_json_host(trinarkular_probelist_t *pl,
-                                    trinarkular_slash24_t *s24, char *json,
-                                    jsmntok_t *t)
+                                    trinarkular_slash24_t *s24, int proto,
+                                    char *json, jsmntok_t *t)
 {
   int cnt = 0;
   int i;
   char host_str[INET_ADDRSTRLEN];
   uint32_t host_ip;
   int host_ip_set = 0;
+  unsigned long port = 0;
+  int port_set = 0;
 
   jsmn_type_assert(t, JSMN_OBJECT);
   cnt = t->size;
@@ -277,6 +315,15 @@ static jsmntok_t *process_json_host(trinarkular_probelist_t *pl,
       jsmn_type_assert(t, JSMN_PRIMITIVE);
       // ignore response rate field
       JSMN_NEXT(t);
+    } else if (jsmn_streq(json, t, "port")) {
+      JSMN_NEXT(t);
+      jsmn_type_assert(t, JSMN_PRIMITIVE);
+      if (jsmn_strtoul(&port, json, t) != 0 || port == 0 || port > UINT16_MAX) {
+        trinarkular_log("ERROR: Invalid port in host object");
+        goto err;
+      }
+      port_set = 1;
+      JSMN_NEXT(t);
     } else {
       // ignore all other fields
       JSMN_NEXT(t);
@@ -290,7 +337,13 @@ static jsmntok_t *process_json_host(trinarkular_probelist_t *pl,
     goto err;
   }
 
-  if (add_host(s24, host_ip) != 0) {
+  // every non-ICMP host needs the port it is probed on
+  if (proto != TRINARKULAR_PROBE_PROTO_ICMP && port_set == 0) {
+    trinarkular_log("ERROR: Missing port in host object (%s)", host_str);
+    goto err;
+  }
+
+  if (add_host(s24, proto, host_ip, port) != 0) {
     trinarkular_log("ERROR: Could not add host to /24 (%s)", host_str);
     goto err;
   }
@@ -301,11 +354,164 @@ err:
   return NULL;
 }
 
+/** Fields shared by a /24 record in the single-protocol format and by each
+ * entry of "protocols" in the multi-protocol format */
+struct hostset_fields {
+  unsigned long host_cnt;
+  int host_cnt_set;
+  int avg_resp_rate_set;
+  int host_arr_cnt;
+};
+
+/** Parse one hostset field (host_cnt, avg_resp_rate or hosts) at t.
+ * @return pointer to the next token, t unchanged if the key is not a hostset
+ * field, or NULL on error */
+static jsmntok_t *process_json_hostset_field(trinarkular_probelist_t *pl,
+                                             trinarkular_slash24_t *s24,
+                                             int proto, char *json,
+                                             jsmntok_t *t,
+                                             struct hostset_fields *f)
+{
+  trinarkular_slash24_hosts_t *h = &s24->proto[proto];
+  double avg_resp_rate = 0;
+  int j;
+
+  if (jsmn_streq(json, t, "host_cnt")) {
+    JSMN_NEXT(t);
+    jsmn_type_assert(t, JSMN_PRIMITIVE);
+    if (jsmn_strtoul(&f->host_cnt, json, t) != 0) {
+      trinarkular_log("ERROR: Could not parse host count");
+      goto err;
+    }
+    f->host_cnt_set = 1;
+    JSMN_NEXT(t);
+
+  } else if (jsmn_streq(json, t, "avg_resp_rate")) {
+    JSMN_NEXT(t);
+    jsmn_type_assert(t, JSMN_PRIMITIVE);
+    if (jsmn_strtod(&avg_resp_rate, json, t) != 0) {
+      trinarkular_log("ERROR: Could not parse avg resp rate");
+      goto err;
+    }
+    h->aeb = avg_resp_rate;
+    f->avg_resp_rate_set = 1;
+    JSMN_NEXT(t);
+
+  } else if (jsmn_streq(json, t, "hosts")) {
+    JSMN_NEXT(t);
+    jsmn_type_assert(t, JSMN_ARRAY);
+    f->host_arr_cnt = t->size; // number of host objects
+    JSMN_NEXT(t);
+    for (j = 0; j < f->host_arr_cnt; j++) {
+      if ((t = process_json_host(pl, s24, proto, json, t)) == NULL) {
+        goto err;
+      }
+    }
+
+    // now randomize the ordering
+    shuffle_hosts(h);
+  }
+
+  return t;
+
+err:
+  return NULL;
+}
+
+static int hostset_fields_check(struct hostset_fields *f)
+{
+  if (f->host_cnt_set == 0 || f->avg_resp_rate_set == 0 ||
+      f->host_arr_cnt == 0) {
+    return -1;
+  }
+  // final sanity check
+  assert(f->host_arr_cnt == f->host_cnt);
+  return 0;
+}
+
+/** Parse the "protocols" object of a multi-protocol /24 record */
+static jsmntok_t *process_json_protocols(trinarkular_probelist_t *pl,
+                                         trinarkular_slash24_t *s24,
+                                         char *json, jsmntok_t *t)
+{
+  int proto_cnt, field_cnt;
+  int i, j, proto;
+  jsmntok_t *next;
+  struct hostset_fields f;
+
+  jsmn_type_assert(t, JSMN_OBJECT);
+  proto_cnt = t->size;
+  JSMN_NEXT(t);
+
+  for (i = 0; i < proto_cnt; i++) {
+    jsmn_type_assert(t, JSMN_STRING);
+    if (jsmn_streq(json, t, "icmp")) {
+      proto = TRINARKULAR_PROBE_PROTO_ICMP;
+    } else if (jsmn_streq(json, t, "tcp")) {
+      proto = TRINARKULAR_PROBE_PROTO_TCP;
+    } else {
+      trinarkular_log("WARN: Unrecognized protocol: %.*s", t->end - t->start,
+                      json + t->start);
+      JSMN_NEXT(t);
+      t = jsmn_skip(t);
+      continue;
+    }
+    JSMN_NEXT(t);
+
+    jsmn_type_assert(t, JSMN_OBJECT);
+    field_cnt = t->size;
+    JSMN_NEXT(t);
+    memset(&f, 0, sizeof(f));
+    for (j = 0; j < field_cnt; j++) {
+      jsmn_type_assert(t, JSMN_STRING);
+      if ((next = process_json_hostset_field(pl, s24, proto, json, t, &f)) ==
+          NULL) {
+        goto err;
+      }
+      if (next == t) {
+        trinarkular_log("WARN: Unrecognized key: %.*s", t->end - t->start,
+                        json + t->start);
+        JSMN_NEXT(t);
+        next = jsmn_skip(t);
+      }
+      t = next;
+    }
+    if (hostset_fields_check(&f) != 0) {
+      trinarkular_log("ERROR: Missing field in protocol record");
+      goto err;
+    }
+    pl->signals |= TRINARKULAR_SIGNAL_BIT(proto);
+  }
+
+  pl->signals |= TRINARKULAR_SIGNAL_BIT(TRINARKULAR_SIGNAL_COMBINED);
+
+  return t;
+
+err:
+  return NULL;
+}
+
+/* A /24 record is either in the original single-protocol format, whose
+ * host_cnt, avg_resp_rate and hosts are ICMP:
+ *
+ *   {"version": ..., "meta": [...],
+ *    "host_cnt": N, "avg_resp_rate": A, "hosts": [{"host_ip": ...}, ...]}
+ *
+ * or in the multi-protocol format, with the same three fields per protocol,
+ * and a port on every non-ICMP host:
+ *
+ *   {"version": ..., "meta": [...],
+ *    "protocols": {
+ *      "icmp": {"host_cnt": N, "avg_resp_rate": A, "hosts": [...]},
+ *      "tcp":  {"host_cnt": N, "avg_resp_rate": A,
+ *               "hosts": [{"host_ip": ..., "port": 80}, ...]}}}
+ */
 static jsmntok_t *process_json_slash24(trinarkular_probelist_t *pl,
                                        char *s24_str, char *json,
                                        jsmntok_t *root_tok)
 {
   jsmntok_t *t = root_tok + 1;
+  jsmntok_t *next;
   int i, j;
 
   char *tmp;
@@ -314,16 +520,13 @@ static jsmntok_t *process_json_slash24(trinarkular_probelist_t *pl,
 
   char str_tmp[1024];
 
-  unsigned long host_cnt = 0;
-  int host_cnt_set = 0;
-
-  double avg_resp_rate = 0;
-  int avg_resp_rate_set = 0;
+  struct hostset_fields icmp;
+  int protocols_set = 0;
 
   int meta_cnt = 0;
   int meta_set = 0;
 
-  int host_arr_cnt = 0;
+  memset(&icmp, 0, sizeof(icmp));
 
   // first, add the /24 so that as we parse we can update it directly
 
@@ -362,29 +565,6 @@ static jsmntok_t *process_json_slash24(trinarkular_probelist_t *pl,
       }
       JSMN_NEXT(t);
 
-      // host cnt
-    } else if (jsmn_streq(json, t, "host_cnt")) {
-      JSMN_NEXT(t);
-      jsmn_type_assert(t, JSMN_PRIMITIVE);
-      if (jsmn_strtoul(&host_cnt, json, t) != 0) {
-        trinarkular_log("ERROR: Could not parse host count");
-        goto err;
-      }
-      host_cnt_set = 1;
-      JSMN_NEXT(t);
-
-      // avg resp rate
-    } else if (jsmn_streq(json, t, "avg_resp_rate")) {
-      JSMN_NEXT(t);
-      jsmn_type_assert(t, JSMN_PRIMITIVE);
-      if (jsmn_strtod(&avg_resp_rate, json, t) != 0) {
-        trinarkular_log("ERROR: Could not parse avg resp rate");
-        goto err;
-      }
-      s24->aeb = avg_resp_rate;
-      avg_resp_rate_set = 1;
-      JSMN_NEXT(t);
-
       // meta
     } else if (jsmn_streq(json, t, "meta")) {
       JSMN_NEXT(t);
@@ -401,37 +581,49 @@ static jsmntok_t *process_json_slash24(trinarkular_probelist_t *pl,
       }
       meta_set = 1;
 
-    } else if (jsmn_streq(json, t, "hosts")) {
+      // multi-protocol format
+    } else if (jsmn_streq(json, t, "protocols")) {
       JSMN_NEXT(t);
-      jsmn_type_assert(t, JSMN_ARRAY);
-      host_arr_cnt = t->size; // number of host objects
-      JSMN_NEXT(t);
-      for (j = 0; j < host_arr_cnt; j++) {
-        if ((t = process_json_host(pl, s24, json, t)) == NULL) {
-          goto err;
-        }
+      if ((t = process_json_protocols(pl, s24, json, t)) == NULL) {
+        goto err;
       }
+      protocols_set = 1;
 
-      // now randomize the ordering
-      array_shuffle_fy(uint8_t, s24->hosts, s24->hosts_cnt);
-
-      // unknown key
     } else {
-      trinarkular_log("WARN: Unrecognized key: %.*s", t->end - t->start,
-                      json + t->start);
-      JSMN_NEXT(t);
-      t = jsmn_skip(t);
+      // single-protocol format: host_cnt, avg_resp_rate, hosts are ICMP
+      if ((next = process_json_hostset_field(
+             pl, s24, TRINARKULAR_PROBE_PROTO_ICMP, json, t, &icmp)) == NULL) {
+        goto err;
+      }
+      if (next == t) {
+        // unknown key
+        trinarkular_log("WARN: Unrecognized key: %.*s", t->end - t->start,
+                        json + t->start);
+        JSMN_NEXT(t);
+        next = jsmn_skip(t);
+      }
+      t = next;
     }
   }
 
-  if (pl->version == NULL || host_cnt_set == 0 || avg_resp_rate_set == 0 ||
-      meta_set == 0 || host_arr_cnt == 0) {
+  if (pl->version == NULL || meta_set == 0) {
     trinarkular_log("ERROR: Missing field in /24 record");
     goto err;
   }
 
-  // final sanity check
-  assert(host_arr_cnt == host_cnt);
+  if (protocols_set != 0) {
+    if (icmp.host_cnt_set || icmp.avg_resp_rate_set || icmp.host_arr_cnt) {
+      trinarkular_log("ERROR: /24 record mixes single- and multi-protocol "
+                      "fields");
+      goto err;
+    }
+  } else {
+    if (hostset_fields_check(&icmp) != 0) {
+      trinarkular_log("ERROR: Missing field in /24 record");
+      goto err;
+    }
+    pl->signals |= TRINARKULAR_SIGNAL_BIT(TRINARKULAR_SIGNAL_ICMP);
+  }
 
   return t;
 
@@ -708,6 +900,11 @@ char *trinarkular_probelist_get_version(trinarkular_probelist_t *pl)
   return pl->version;
 }
 
+uint8_t trinarkular_probelist_get_signals(trinarkular_probelist_t *pl)
+{
+  return pl->signals;
+}
+
 int trinarkular_probelist_get_slash24_cnt(trinarkular_probelist_t *pl)
 {
   return pl->slash24s_cnt;
@@ -794,7 +991,8 @@ trinarkular_slash24_state_t *trinarkular_slash24_state_create(int metrics_cnt)
   // init per-/24 metrics
   // allocate enough metrics structures
   if ((state->metrics = malloc_zero(sizeof(trinarkular_slash24_metrics_t) *
-                                    metrics_cnt)) == NULL) {
+                                    metrics_cnt * TRINARKULAR_SIGNAL_CNT)) ==
+      NULL) {
     goto err;
   }
 
@@ -898,14 +1096,23 @@ void *trinarkular_probelist_get_slash24_state(trinarkular_probelist_t *pl,
 }
 
 uint32_t trinarkular_probelist_get_next_host(trinarkular_slash24_t *s24,
-                                             trinarkular_slash24_state_t *state)
+                                             trinarkular_slash24_state_t *state,
+                                             int proto, uint16_t *port)
 {
+  trinarkular_slash24_hosts_t *h = &s24->proto[proto];
+  trinarkular_signal_state_t *sig = &state->sig[proto];
+  uint8_t idx;
+
+  assert(h->hosts_cnt > 0);
+
   // current_host is an 8bit field, so this check will never actively reset the
   // counter when hosts_cnt is 256 -- we trust that the value will correctly
   // wrap to zero when it is post-incremented from 255
-  if (state->current_host >= s24->hosts_cnt) {
-    state->current_host = 0;
+  if (sig->current_host >= h->hosts_cnt) {
+    sig->current_host = 0;
   }
 
-  return s24->network_ip | s24->hosts[state->current_host++];
+  idx = sig->current_host++;
+  *port = (h->ports != NULL) ? h->ports[idx] : 0;
+  return s24->network_ip | h->hosts[idx];
 }

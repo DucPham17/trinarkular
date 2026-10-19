@@ -57,6 +57,21 @@
 
 /* NB: if changing any of these structures, IO functions must also be updated */
 
+/** Protocols a probe can use. ICMP must stay 0: requests that do not set a
+ * protocol are ICMP, as they were before protocols existed. */
+typedef enum trinarkular_probe_proto {
+
+  /** ICMP echo request */
+  TRINARKULAR_PROBE_PROTO_ICMP = 0,
+
+  /** TCP SYN to the request's port */
+  TRINARKULAR_PROBE_PROTO_TCP = 1,
+
+  /** Number of probe protocols */
+  TRINARKULAR_PROBE_PROTO_CNT = 2,
+
+} trinarkular_probe_proto_t;
+
 /** Structure used when making a probe request to a driver */
 typedef struct trinarkular_probe_req {
 
@@ -70,6 +85,12 @@ typedef struct trinarkular_probe_req {
 
   /** Number of seconds to wait for a reply */
   uint8_t wait;
+
+  /** The protocol to probe with (trinarkular_probe_proto_t) */
+  uint8_t proto;
+
+  /** Destination port (host byte order), 0 for ICMP */
+  uint16_t port;
 
 } __attribute__((packed)) trinarkular_probe_req_t;
 
@@ -101,6 +122,12 @@ typedef struct trinarkular_probe_resp {
 
   /** The number of probes that were responded to in total */
   uint8_t probes_replied;
+
+  /** The protocol of the request (echoed by the driver) */
+  uint8_t proto;
+
+  /** The port of the request (echoed by the driver) */
+  uint16_t port;
 
 } __attribute__((packed)) trinarkular_probe_resp_t;
 

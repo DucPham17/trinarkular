@@ -82,6 +82,22 @@
 // metric prefix for prober metadata
 #define METRIC_PREFIX_PROBER METRIC_PREFIX ".probers"
 
+/** Metric prefix per signal (indexed by trinarkular_signal_id_t). ICMP keeps
+ * the original prefix, so a single-protocol probelist produces exactly the
+ * metrics it always has. The combined prefix names its contents so that adding
+ * a protocol later cannot silently change what an existing series means. */
+static const char *signal_prefixes[] = {
+  METRIC_PREFIX,                      // TRINARKULAR_SIGNAL_ICMP
+  "active.tcp-slash24",               // TRINARKULAR_SIGNAL_TCP
+  "active.combined-icmp-tcp-slash24", // TRINARKULAR_SIGNAL_COMBINED
+};
+
+/** Names of probe protocols, for logging */
+static const char *proto_names[] = {
+  "icmp", // TRINARKULAR_PROBE_PROTO_ICMP
+  "tcp",  // TRINARKULAR_PROBE_PROTO_TCP
+};
+
 #define CH_SLASH24 "__PFX_%s_24"
 
 // used to coordinate between main thread and probelist reload thread
@@ -143,7 +159,14 @@ static int recovery_probe_cnt[] = {
   1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1, 1, 1,
 };
 
-#define AEB_TO_RECOVERY(s24) recovery_probe_cnt[(int)((s24)->aeb * 100)]
+// recovery_probe_cnt has entries for A(E(b)) of 0.00-0.98; clamp so that
+// 0.99 and 1.0 use the last entry rather than reading past the array
+#define RECOVERY_PROBE_CNT_LEN                                                 \
+  ((int)(sizeof(recovery_probe_cnt) / sizeof(recovery_probe_cnt[0])))
+#define AEB_TO_RECOVERY(aeb)                                                   \
+  recovery_probe_cnt[((int)((aeb)*100) < RECOVERY_PROBE_CNT_LEN)              \
+                       ? (int)((aeb)*100)                                      \
+                       : RECOVERY_PROBE_CNT_LEN - 1]
 
 /** Stop exponential backoff once rounds_since_up reaches 16 */
 #define RECOVERY_BACKOFF_MAX 16
@@ -161,20 +184,20 @@ struct metrics {
   /** Value is NOW - round_start */
   int round_duration;
 
-  /** Value is the number of /24s probed in the round */
-  int round_probe_cnt[PROBE_TYPE_CNT];
+  /** Value is the number of /24s probed in the round (per protocol) */
+  int round_probe_cnt[TRINARKULAR_PROBE_PROTO_CNT][PROBE_TYPE_CNT];
 
   /** Value is the number of /24s that we got responses for in the round */
-  int round_probe_complete_cnt[PROBE_TYPE_CNT];
+  int round_probe_complete_cnt[TRINARKULAR_PROBE_PROTO_CNT][PROBE_TYPE_CNT];
 
   /** Value is the number of /24s that appeared alive this round */
-  int round_responsive_cnt[PROBE_TYPE_CNT];
+  int round_responsive_cnt[TRINARKULAR_PROBE_PROTO_CNT][PROBE_TYPE_CNT];
 
-  /** Values are the number of /24s in each state */
-  int slash24_state_cnts[BELIEF_STATE_CNT];
+  /** Values are the number of /24s in each state (per signal) */
+  int slash24_state_cnts[TRINARKULAR_SIGNAL_CNT][BELIEF_STATE_CNT];
 
-  /** Value is the number of /24s that we are probing */
-  int slash24_cnt;
+  /** Value is the number of /24s that we are probing (per signal) */
+  int slash24_cnt[TRINARKULAR_SIGNAL_CNT];
 };
 
 /** Max number of rounds that are currently being tracked. Most of the time this
@@ -186,20 +209,20 @@ typedef struct probing_stats {
   /** The walltime that the round started at */
   uint64_t start_time;
 
-  /** The number of probes sent this round (PERIODIC and ADAPTIVE) */
-  uint32_t probe_cnt[PROBE_TYPE_CNT];
+  /** The number of probes sent this round (per protocol and type) */
+  uint32_t probe_cnt[TRINARKULAR_PROBE_PROTO_CNT][PROBE_TYPE_CNT];
 
   /** The number of responses received this round */
-  uint32_t probe_complete_cnt[PROBE_TYPE_CNT];
+  uint32_t probe_complete_cnt[TRINARKULAR_PROBE_PROTO_CNT][PROBE_TYPE_CNT];
 
   /** The number of responsive probes this round */
-  uint32_t responsive_cnt[PROBE_TYPE_CNT];
+  uint32_t responsive_cnt[TRINARKULAR_PROBE_PROTO_CNT][PROBE_TYPE_CNT];
 
-  /** The number of /24s in each state */
-  uint32_t slash24_state_cnts[BELIEF_STATE_CNT];
+  /** The number of /24s in each state (per signal) */
+  uint32_t slash24_state_cnts[TRINARKULAR_SIGNAL_CNT][BELIEF_STATE_CNT];
 
-  /** The number of /24s that we are probing */
-  uint32_t slash24_cnt;
+  /** The number of /24s that we are probing (per signal) */
+  uint32_t slash24_cnt[TRINARKULAR_SIGNAL_CNT];
 
 } probing_stats_t;
 
@@ -250,6 +273,9 @@ struct params {
 #define ACTIVE_KP_AGGR(p)    (p->pl_states[p->pl_state_active_idx].kp_aggr)
 #define ACTIVE_KP_SLASH24(p) (p->pl_states[p->pl_state_active_idx].kp_slash24)
 #define ACTIVE_METRICS(p)    (p->pl_states[p->pl_state_active_idx].metrics)
+#define ACTIVE_SIGNALS(p)    (p->pl_states[p->pl_state_active_idx].signals)
+#define NEXT_SIGNALS(p)      (p->pl_states[!p->pl_state_active_idx].signals)
+#define HAS_SIGNAL(signals, sig) (((signals)&TRINARKULAR_SIGNAL_BIT(sig)) != 0)
 #define NEXT_PL_STATE(p)     (p->pl_states[!p->pl_state_active_idx])
 #define NEXT_PL(p)           (p->pl_states[!p->pl_state_active_idx].pl)
 #define NEXT_KP_AGGR(p)      (p->pl_states[!p->pl_state_active_idx].kp_aggr)
@@ -274,6 +300,9 @@ typedef struct probelist_state {
 
   /** Probing statistics */
   probing_stats_t stats;
+
+  /** Signals the probelist provides (TRINARKULAR_SIGNAL_BIT mask) */
+  uint8_t signals;
 } probelist_state_t;
 
 /* Structure representing a prober instance */
@@ -370,7 +399,8 @@ static char *graphite_safe(char *p)
 static int init_kp(trinarkular_prober_t *prober)
 {
   char buf[BUFFER_LEN];
-  int i;
+  int i, sig, proto;
+  struct metrics *m = &NEXT_PL_STATE(prober).metrics;
 
   // create key packages
   if ((NEXT_KP_SLASH24(prober) =
@@ -382,61 +412,78 @@ static int init_kp(trinarkular_prober_t *prober)
   // round id
   snprintf(buf, BUFFER_LEN, METRIC_PREFIX_PROBER ".%s.meta.round_id",
            prober->name_ts);
-  if ((NEXT_PL_STATE(prober).metrics.round_id =
-         timeseries_kp_add_key(NEXT_KP_AGGR(prober), buf)) == -1) {
+  if ((m->round_id = timeseries_kp_add_key(NEXT_KP_AGGR(prober), buf)) == -1) {
     return -1;
   }
 
   // round duration
   snprintf(buf, BUFFER_LEN, METRIC_PREFIX_PROBER ".%s.meta.round_duration",
            prober->name_ts);
-  if ((NEXT_PL_STATE(prober).metrics.round_duration =
-         timeseries_kp_add_key(NEXT_KP_AGGR(prober), buf)) == -1) {
+  if ((m->round_duration = timeseries_kp_add_key(NEXT_KP_AGGR(prober), buf)) ==
+      -1) {
     return -1;
   }
 
-  for (i = PERIODIC; i <= RECOVERY; i++) {
-    // probe cnt
-    snprintf(buf, BUFFER_LEN, METRIC_PREFIX_PROBER ".%s.probing.%s.probe_cnt",
-             prober->name_ts, probe_types[i]);
-    if ((NEXT_PL_STATE(prober).metrics.round_probe_cnt[i] =
-           timeseries_kp_add_key(NEXT_KP_AGGR(prober), buf)) == -1) {
-      return -1;
+  for (sig = 0; sig < TRINARKULAR_SIGNAL_CNT; sig++) {
+    proto = sig; // probe protocols share their signal's index
+    if (!HAS_SIGNAL(NEXT_SIGNALS(prober), sig)) {
+      for (i = 0; i < BELIEF_STATE_CNT; i++) {
+        m->slash24_state_cnts[sig][i] = -1;
+      }
+      m->slash24_cnt[sig] = -1;
+      if (proto < TRINARKULAR_PROBE_PROTO_CNT) {
+        for (i = 0; i < PROBE_TYPE_CNT; i++) {
+          m->round_probe_cnt[proto][i] = -1;
+          m->round_probe_complete_cnt[proto][i] = -1;
+          m->round_responsive_cnt[proto][i] = -1;
+        }
+      }
+      continue;
     }
 
-    // probe complete cnt
-    snprintf(buf, BUFFER_LEN,
-             METRIC_PREFIX_PROBER ".%s.probing.%s.completed_probe_cnt",
-             prober->name_ts, probe_types[i]);
-    if ((NEXT_PL_STATE(prober).metrics.round_probe_complete_cnt[i] =
-           timeseries_kp_add_key(NEXT_KP_AGGR(prober), buf)) == -1) {
-      return -1;
+    // probe counts, for signals that send probes
+    for (i = PERIODIC; proto < TRINARKULAR_PROBE_PROTO_CNT && i <= RECOVERY;
+         i++) {
+      // probe cnt
+      snprintf(buf, BUFFER_LEN, "%s.probers.%s.probing.%s.probe_cnt",
+               signal_prefixes[sig], prober->name_ts, probe_types[i]);
+      if ((m->round_probe_cnt[proto][i] =
+             timeseries_kp_add_key(NEXT_KP_AGGR(prober), buf)) == -1) {
+        return -1;
+      }
+
+      // probe complete cnt
+      snprintf(buf, BUFFER_LEN, "%s.probers.%s.probing.%s.completed_probe_cnt",
+               signal_prefixes[sig], prober->name_ts, probe_types[i]);
+      if ((m->round_probe_complete_cnt[proto][i] =
+             timeseries_kp_add_key(NEXT_KP_AGGR(prober), buf)) == -1) {
+        return -1;
+      }
+
+      // responsive cnt
+      snprintf(buf, BUFFER_LEN, "%s.probers.%s.probing.%s.responsive_probe_cnt",
+               signal_prefixes[sig], prober->name_ts, probe_types[i]);
+      if ((m->round_responsive_cnt[proto][i] =
+             timeseries_kp_add_key(NEXT_KP_AGGR(prober), buf)) == -1) {
+        return -1;
+      }
     }
 
-    // responsive cnt
-    snprintf(buf, BUFFER_LEN,
-             METRIC_PREFIX_PROBER ".%s.probing.%s.responsive_probe_cnt",
-             prober->name_ts, probe_types[i]);
-    if ((NEXT_PL_STATE(prober).metrics.round_responsive_cnt[i] =
-           timeseries_kp_add_key(NEXT_KP_AGGR(prober), buf)) == -1) {
+    for (i = UNCERTAIN; i < BELIEF_STATE_CNT; i++) {
+      snprintf(buf, BUFFER_LEN, "%s.probers.%s.states.%s_slash24_cnt",
+               signal_prefixes[sig], prober->name_ts, belief_states[i]);
+      if ((m->slash24_state_cnts[sig][i] =
+             timeseries_kp_add_key(NEXT_KP_AGGR(prober), buf)) == -1) {
+        return -1;
+      }
+    }
+
+    snprintf(buf, BUFFER_LEN, "%s.probers.%s.slash24_cnt", signal_prefixes[sig],
+             prober->name_ts);
+    if ((m->slash24_cnt[sig] = timeseries_kp_add_key(NEXT_KP_AGGR(prober),
+                                                     buf)) == -1) {
       return -1;
     }
-  }
-
-  for (i = UNCERTAIN; i < BELIEF_STATE_CNT; i++) {
-    snprintf(buf, BUFFER_LEN, METRIC_PREFIX_PROBER ".%s.states.%s_slash24_cnt",
-             prober->name_ts, belief_states[i]);
-    if ((NEXT_PL_STATE(prober).metrics.slash24_state_cnts[i] =
-           timeseries_kp_add_key(NEXT_KP_AGGR(prober), buf)) == -1) {
-      return -1;
-    }
-  }
-
-  snprintf(buf, BUFFER_LEN, METRIC_PREFIX_PROBER ".%s.slash24_cnt",
-           prober->name_ts);
-  if ((NEXT_PL_STATE(prober).metrics.slash24_cnt =
-         timeseries_kp_add_key(NEXT_KP_AGGR(prober), buf)) == -1) {
-    return -1;
   }
 
   return 0;
@@ -501,6 +548,7 @@ static int slash24_latloss_metrics_create(trinarkular_prober_t *prober,
 
 static int slash24_metrics_create(trinarkular_prober_t *prober,
                                   trinarkular_slash24_metrics_t *metrics,
+                                  const char *prefix,
                                   const char *slash24_string, const char *md,
                                   int per_block_stats)
 {
@@ -512,18 +560,16 @@ static int slash24_metrics_create(trinarkular_prober_t *prober,
   // at continent level)
   if (per_block_stats != 0) {
     // belief
-    snprintf(buf, BUFFER_LEN, METRIC_PREFIX_SLASH24
-             ".%s.probers.%s.blocks." CH_SLASH24 ".belief",
-             md, prober->name_ts, slash24_string);
+    snprintf(buf, BUFFER_LEN, "%s.%s.probers.%s.blocks." CH_SLASH24 ".belief",
+             prefix, md, prober->name_ts, slash24_string);
     if ((metrics->belief =
          timeseries_kp_add_key(NEXT_KP_SLASH24(prober), buf)) == -1) {
       return -1;
     }
 
     // state
-    snprintf(buf, BUFFER_LEN,
-             METRIC_PREFIX_SLASH24 ".%s.probers.%s.blocks." CH_SLASH24 ".state",
-             md, prober->name_ts, slash24_string);
+    snprintf(buf, BUFFER_LEN, "%s.%s.probers.%s.blocks." CH_SLASH24 ".state",
+             prefix, md, prober->name_ts, slash24_string);
     if ((metrics->state =
          timeseries_kp_add_key(NEXT_KP_SLASH24(prober), buf)) == -1) {
       return -1;
@@ -535,8 +581,7 @@ static int slash24_metrics_create(trinarkular_prober_t *prober,
 
   // overall per-state stats
   for (i = UNCERTAIN; i < BELIEF_STATE_CNT; i++) {
-    snprintf(buf, BUFFER_LEN,
-             METRIC_PREFIX_SLASH24 ".%s.probers.%s.%s_slash24_cnt", md,
+    snprintf(buf, BUFFER_LEN, "%s.%s.probers.%s.%s_slash24_cnt", prefix, md,
              prober->name_ts, belief_states[i]);
     if ((metrics->overall[i] =
            timeseries_kp_get_key(NEXT_KP_AGGR(prober), buf)) == -1 &&
@@ -553,27 +598,47 @@ static int slash24_metrics_create(trinarkular_prober_t *prober,
   return 0;
 }
 
+/** Mark a set of /24 metrics as unused (signal not tracked for this /24) */
+static void slash24_metrics_disable(trinarkular_slash24_metrics_t *metrics)
+{
+  int i;
+
+  metrics->belief = -1;
+  metrics->state = -1;
+  for (i = 0; i < BELIEF_STATE_CNT; i++) {
+    metrics->overall[i] = -1;
+  }
+}
+
+/** Does the given signal apply to this /24? A probe protocol applies if the
+ * /24 has hosts for it; the combined signal applies to every /24 of a
+ * probelist that provides it. */
+static int signal_applies(trinarkular_slash24_t *s24, uint8_t signals, int sig)
+{
+  if (!HAS_SIGNAL(signals, sig)) {
+    return 0;
+  }
+  if (sig < TRINARKULAR_PROBE_PROTO_CNT) {
+    return s24->proto[sig].hosts_cnt > 0;
+  }
+  return 1;
+}
+
 static trinarkular_slash24_state_t *
 slash24_state_create(trinarkular_prober_t *prober, trinarkular_slash24_t *s24)
 {
   trinarkular_slash24_state_t *state = NULL;
+  trinarkular_signal_state_t *sig_state;
+  trinarkular_slash24_metrics_t *metrics;
   uint32_t slash24_ip;
   char slash24_str[INET_ADDRSTRLEN];
-  int i;
+  int i, sig;
 
   // need to first create the state
   if ((state = trinarkular_slash24_state_create(s24->md_cnt)) == NULL) {
     trinarkular_log("ERROR: Could not create slash24 state");
     return NULL;
   }
-
-  // initialize things
-  state->last_probe_type = UNPROBED;
-  ADAPTIVE_BUDGET_SET(state, TRINARKULAR_PROBER_ROUND_PROBE_BUDGET);
-  RECOVERY_BUDGET_SET(state, AEB_TO_RECOVERY(s24));
-  state->current_belief = 0.99; // as per paper
-  state->current_state = BELIEF_STATE(state->current_belief);
-  state->rounds_since_up = 0;
 
   // convert the /24 to a string
   slash24_ip = htonl(s24->network_ip);
@@ -584,24 +649,50 @@ slash24_state_create(trinarkular_prober_t *prober, trinarkular_slash24_t *s24)
       return NULL;
   }
 
-  for (i = 0; i < s24->md_cnt; i++) {
-    // create metrics for this metadata
-    if (slash24_metrics_create(prober, &state->metrics[i], slash24_str,
-                               s24->md[i]+2, // skip the '[LN]:' prefix
-                               (s24->md[i][0] == 'L') ? 1 : 0) != 0) {
-      trinarkular_log("ERROR: Could not create slash24 metrics for %s",
-                      s24->md[i]);
-      return NULL;
+  for (sig = 0; sig < TRINARKULAR_SIGNAL_CNT; sig++) {
+    sig_state = &state->sig[sig];
+    metrics = &state->metrics[sig * s24->md_cnt];
+
+    if (!signal_applies(s24, NEXT_SIGNALS(prober), sig)) {
+      for (i = 0; i < s24->md_cnt; i++) {
+        slash24_metrics_disable(&metrics[i]);
+      }
+      continue;
     }
-    // to save a little memory, we free the metadata strings
+
+    // initialize things
+    sig_state->last_probe_type = UNPROBED;
+    if (sig < TRINARKULAR_PROBE_PROTO_CNT) {
+      ADAPTIVE_BUDGET_SET(sig_state, TRINARKULAR_PROBER_ROUND_PROBE_BUDGET);
+      RECOVERY_BUDGET_SET(sig_state, AEB_TO_RECOVERY(s24->proto[sig].aeb));
+    }
+    sig_state->current_belief = 0.99; // as per paper
+    sig_state->current_state = BELIEF_STATE(sig_state->current_belief);
+    sig_state->rounds_since_up = 0;
+
+    for (i = 0; i < s24->md_cnt; i++) {
+      // create metrics for this metadata
+      if (slash24_metrics_create(prober, &metrics[i], signal_prefixes[sig],
+                                 slash24_str,
+                                 s24->md[i]+2, // skip the '[LN]:' prefix
+                                 (s24->md[i][0] == 'L') ? 1 : 0) != 0) {
+        trinarkular_log("ERROR: Could not create slash24 metrics for %s",
+                        s24->md[i]);
+        return NULL;
+      }
+    }
+
+    NEXT_STAT(slash24_state_cnts[sig][UP])++;
+    NEXT_STAT(slash24_cnt[sig])++;
+  }
+
+  // to save a little memory, we free the metadata strings
+  for (i = 0; i < s24->md_cnt; i++) {
     free(s24->md[i]);
   }
   free(s24->md);
   s24->md = NULL;
   s24->md_cnt = 0;
-
-  NEXT_STAT(slash24_state_cnts[UP])++;
-  NEXT_STAT(slash24_cnt)++;
 
   // now, attach it
   if (trinarkular_probelist_save_slash24_state(NEXT_PL(prober),
@@ -621,53 +712,53 @@ err:
 
 static void reset_round_stats(trinarkular_prober_t *prober, uint64_t start_time)
 {
-  int i;
 
   ACTIVE_STAT(start_time) = start_time;
 
-  for (i = UNPROBED; i < PROBE_TYPE_CNT; i++) {
-    ACTIVE_STAT(probe_cnt[i]) = 0;
-    ACTIVE_STAT(probe_complete_cnt[i]) = 0;
-    ACTIVE_STAT(responsive_cnt[i]) = 0;
-  }
+  memset(ACTIVE_STAT(probe_cnt), 0, sizeof(ACTIVE_STAT(probe_cnt)));
+  memset(ACTIVE_STAT(probe_complete_cnt), 0,
+         sizeof(ACTIVE_STAT(probe_complete_cnt)));
+  memset(ACTIVE_STAT(responsive_cnt), 0, sizeof(ACTIVE_STAT(responsive_cnt)));
 }
 
-/** Queue a probe for the given /24 */
+/** Queue a probe for the given /24 with the given protocol */
 static int queue_slash24_probe(trinarkular_prober_t *prober,
                                trinarkular_slash24_t *s24,
-                               trinarkular_slash24_state_t *state,
+                               trinarkular_slash24_state_t *state, int proto,
                                int probe_type)
 {
   uint32_t host_ip;
-  char ipbuf[INET_ADDRSTRLEN];
+  uint16_t port;
+  trinarkular_signal_state_t *sig_state = &state->sig[proto];
 
   trinarkular_probe_req_t req = {
-    0, PARAM(periodic_probe_timeout),
+    0, PARAM(periodic_probe_timeout), proto, 0,
   };
   struct driver_wrap *dw;
 
   int ret;
 
   assert(state != NULL);
+  assert(proto < TRINARKULAR_PROBE_PROTO_CNT);
   // slash24_state is valid here
 
   // identify the appropriate host to probe
-  host_ip = trinarkular_probelist_get_next_host(s24, state);
+  host_ip = trinarkular_probelist_get_next_host(s24, state, proto, &port);
   req.target_ip = htonl(host_ip);
-  inet_ntop(AF_INET, &req.target_ip, ipbuf, INET_ADDRSTRLEN);
+  req.port = port;
 
   // indicate that we are waiting for a response
-  state->last_probe_type = probe_type;
-  ACTIVE_STAT(probe_cnt[probe_type])++;
+  sig_state->last_probe_type = probe_type;
+  ACTIVE_STAT(probe_cnt[proto][probe_type])++;
 
   // decrement the probe budget (periodic doesn't affect this)
   // (its up to the caller to ensure that we have enough probes in the budget)
   if (probe_type == ADAPTIVE) {
-    assert(ADAPTIVE_BUDGET(state) > 0);
-    ADAPTIVE_BUDGET_SET(state, ADAPTIVE_BUDGET(state) - 1);
+    assert(ADAPTIVE_BUDGET(sig_state) > 0);
+    ADAPTIVE_BUDGET_SET(sig_state, ADAPTIVE_BUDGET(sig_state) - 1);
   } else if (probe_type == RECOVERY) {
-    assert(RECOVERY_BUDGET(state) > 0);
-    RECOVERY_BUDGET_SET(state, RECOVERY_BUDGET(state) - 1);
+    assert(RECOVERY_BUDGET(sig_state) > 0);
+    RECOVERY_BUDGET_SET(sig_state, RECOVERY_BUDGET(sig_state) - 1);
   }
 
   dw = &prober->drivers[prober->drivers_next];
@@ -723,7 +814,8 @@ static int end_of_round(trinarkular_prober_t *prober, int round_id)
   uint64_t aligned_start =
     ((uint64_t)(ACTIVE_STAT(start_time) / PARAM(periodic_round_duration))) *
     PARAM(periodic_round_duration);
-  int i;
+  int i, sig;
+  struct metrics *m = &ACTIVE_METRICS(prober);
 
   set_slash24_kp_values(prober);
 
@@ -733,35 +825,44 @@ static int end_of_round(trinarkular_prober_t *prober, int round_id)
                     ACTIVE_METRICS(prober).round_duration,
                     now - ACTIVE_STAT(start_time));
 
-  for (i = PERIODIC; i < PROBE_TYPE_CNT; i++) {
-    timeseries_kp_set(ACTIVE_KP_AGGR(prober),
-                      ACTIVE_METRICS(prober).round_probe_cnt[i],
-                      ACTIVE_STAT(probe_cnt[i]));
-    timeseries_kp_set(ACTIVE_KP_AGGR(prober),
-                      ACTIVE_METRICS(prober).round_probe_complete_cnt[i],
-                      ACTIVE_STAT(probe_complete_cnt[i]));
-    timeseries_kp_set(ACTIVE_KP_AGGR(prober),
-                      ACTIVE_METRICS(prober).round_responsive_cnt[i],
-                      ACTIVE_STAT(responsive_cnt[i]));
-  }
+  for (sig = 0; sig < TRINARKULAR_SIGNAL_CNT; sig++) {
+    if (!HAS_SIGNAL(ACTIVE_SIGNALS(prober), sig)) {
+      continue;
+    }
 
-  for (i = UNCERTAIN; i < BELIEF_STATE_CNT; i++) {
-    timeseries_kp_set(ACTIVE_KP_AGGR(prober),
-                      ACTIVE_METRICS(prober).slash24_state_cnts[i],
-                      ACTIVE_STAT(slash24_state_cnts[i]));
-  }
+    for (i = PERIODIC; sig < TRINARKULAR_PROBE_PROTO_CNT && i < PROBE_TYPE_CNT;
+         i++) {
+      timeseries_kp_set(ACTIVE_KP_AGGR(prober), m->round_probe_cnt[sig][i],
+                        ACTIVE_STAT(probe_cnt[sig][i]));
+      timeseries_kp_set(ACTIVE_KP_AGGR(prober),
+                        m->round_probe_complete_cnt[sig][i],
+                        ACTIVE_STAT(probe_complete_cnt[sig][i]));
+      timeseries_kp_set(ACTIVE_KP_AGGR(prober), m->round_responsive_cnt[sig][i],
+                        ACTIVE_STAT(responsive_cnt[sig][i]));
+    }
 
-  timeseries_kp_set(ACTIVE_KP_AGGR(prober), ACTIVE_METRICS(prober).slash24_cnt,
-                    ACTIVE_STAT(slash24_cnt));
+    for (i = UNCERTAIN; i < BELIEF_STATE_CNT; i++) {
+      timeseries_kp_set(ACTIVE_KP_AGGR(prober), m->slash24_state_cnts[sig][i],
+                        ACTIVE_STAT(slash24_state_cnts[sig][i]));
+    }
+
+    timeseries_kp_set(ACTIVE_KP_AGGR(prober), m->slash24_cnt[sig],
+                      ACTIVE_STAT(slash24_cnt[sig]));
+  }
 
   trinarkular_log("round %d completed in %" PRIu64 "ms (ideal: %" PRIu64 "ms)",
                   round_id, now - ACTIVE_STAT(start_time),
                   PARAM(periodic_round_duration));
-  trinarkular_log("round periodic response rate: %d/%d (%0.0f%%)",
-                  ACTIVE_STAT(responsive_cnt[PERIODIC]),
-                  ACTIVE_STAT(probe_cnt[PERIODIC]),
-                  ACTIVE_STAT(responsive_cnt[PERIODIC]) * 100.0 /
-                    ACTIVE_STAT(probe_cnt[PERIODIC]));
+  for (sig = 0; sig < TRINARKULAR_PROBE_PROTO_CNT; sig++) {
+    if (!HAS_SIGNAL(ACTIVE_SIGNALS(prober), sig)) {
+      continue;
+    }
+    trinarkular_log("round periodic response rate (%s): %d/%d (%0.0f%%)",
+                    proto_names[sig], ACTIVE_STAT(responsive_cnt[sig][PERIODIC]),
+                    ACTIVE_STAT(probe_cnt[sig][PERIODIC]),
+                    ACTIVE_STAT(responsive_cnt[sig][PERIODIC]) * 100.0 /
+                      ACTIVE_STAT(probe_cnt[sig][PERIODIC]));
+  }
 
   // flush the kps
   if (timeseries_kp_flush(ACTIVE_KP_AGGR(prober), aligned_start / 1000) != 0 ||
@@ -788,7 +889,7 @@ int probelist_state_destroy(probelist_state_t *pl_state)
 
 static int process_geoasn_line(trinarkular_prober_t *prober, char *buffer) {
   char buf[BUFFER_LEN];
-  int i;
+  int i, sig;
   char *tok, *ptr;
   uint64_t asn, regionid;
 
@@ -815,14 +916,19 @@ static int process_geoasn_line(trinarkular_prober_t *prober, char *buffer) {
         return -1;
       }
 
-      for (i = UNCERTAIN; i < BELIEF_STATE_CNT; i++) {
-        snprintf(buf, BUFFER_LEN,
-               METRIC_PREFIX_SLASH24
-               ".geoasn.ipinfo.region.%lu.%lu.probers.%s.%s_slash24_cnt",
-               asn, regionid, prober->name_ts, belief_states[i]);
-        if (timeseries_kp_get_key(NEXT_KP_AGGR(prober), buf) == -1 &&
-              timeseries_kp_add_key(NEXT_KP_AGGR(prober), buf) == -1) {
-          return -1;
+      for (sig = 0; sig < TRINARKULAR_SIGNAL_CNT; sig++) {
+        if (!HAS_SIGNAL(NEXT_SIGNALS(prober), sig)) {
+          continue;
+        }
+        for (i = UNCERTAIN; i < BELIEF_STATE_CNT; i++) {
+          snprintf(buf, BUFFER_LEN,
+                 "%s.geoasn.ipinfo.region.%lu.%lu.probers.%s.%s_slash24_cnt",
+                 signal_prefixes[sig], asn, regionid, prober->name_ts,
+                 belief_states[i]);
+          if (timeseries_kp_get_key(NEXT_KP_AGGR(prober), buf) == -1 &&
+                timeseries_kp_add_key(NEXT_KP_AGGR(prober), buf) == -1) {
+            return -1;
+          }
         }
       }
     } else {
@@ -838,14 +944,19 @@ static int process_geoasn_line(trinarkular_prober_t *prober, char *buffer) {
           return -1;
       }
 
-      for (i = UNCERTAIN; i < BELIEF_STATE_CNT; i++) {
-        snprintf(buf, BUFFER_LEN,
-               METRIC_PREFIX_SLASH24
-               ".geoasn.ipinfo.country.%lu.%s.probers.%s.%s_slash24_cnt",
-               asn, tok, prober->name_ts, belief_states[i]);
-        if (timeseries_kp_get_key(NEXT_KP_AGGR(prober), buf) == -1 &&
-              timeseries_kp_add_key(NEXT_KP_AGGR(prober), buf) == -1) {
-          return -1;
+      for (sig = 0; sig < TRINARKULAR_SIGNAL_CNT; sig++) {
+        if (!HAS_SIGNAL(NEXT_SIGNALS(prober), sig)) {
+          continue;
+        }
+        for (i = UNCERTAIN; i < BELIEF_STATE_CNT; i++) {
+          snprintf(buf, BUFFER_LEN,
+                 "%s.geoasn.ipinfo.country.%lu.%s.probers.%s.%s_slash24_cnt",
+                 signal_prefixes[sig], asn, tok, prober->name_ts,
+                 belief_states[i]);
+          if (timeseries_kp_get_key(NEXT_KP_AGGR(prober), buf) == -1 &&
+                timeseries_kp_add_key(NEXT_KP_AGGR(prober), buf) == -1) {
+            return -1;
+          }
         }
       }
     }
@@ -899,6 +1010,13 @@ static int trinarkular_prober_prepare_probelist(trinarkular_prober_t *prober)
     goto err;
   }
 
+  NEXT_SIGNALS(prober) = trinarkular_probelist_get_signals(NEXT_PL(prober));
+  for (i = 0; i < TRINARKULAR_SIGNAL_CNT; i++) {
+    if (HAS_SIGNAL(NEXT_SIGNALS(prober), i)) {
+      trinarkular_log("Probelist provides the %s signal", signal_prefixes[i]);
+    }
+  }
+
   // re-initialize key packages
   if (init_kp(prober) != 0) {
     trinarkular_log("ERROR: Could not create timeseries key package");
@@ -906,10 +1024,10 @@ static int trinarkular_prober_prepare_probelist(trinarkular_prober_t *prober)
   }
 
   // re-initialize statistics
-  for (i = UNCERTAIN; i < BELIEF_STATE_CNT; i++) {
-      NEXT_PL_STATE(prober).stats.slash24_state_cnts[i] = 0;
-  }
-  NEXT_PL_STATE(prober).stats.slash24_cnt = 0;
+  memset(NEXT_PL_STATE(prober).stats.slash24_state_cnts, 0,
+         sizeof(NEXT_PL_STATE(prober).stats.slash24_state_cnts));
+  memset(NEXT_PL_STATE(prober).stats.slash24_cnt, 0,
+         sizeof(NEXT_PL_STATE(prober).stats.slash24_cnt));
 
   // and create all the state (including timeseries metrics)
   trinarkular_probelist_reset_slash24_iter(NEXT_PL(prober));
@@ -1039,6 +1157,8 @@ static int handle_timer(zloop_t *loop, int timer_id, void *arg)
 
   trinarkular_slash24_t *s24 = NULL;         // BORROWED
   trinarkular_slash24_state_t *state = NULL; // BORROWED
+  trinarkular_signal_state_t *sig_state;     // BORROWED
+  int proto;
 
   CHECK_SHUTDOWN;
 
@@ -1123,31 +1243,41 @@ static int handle_timer(zloop_t *loop, int timer_id, void *arg)
       return -1;
     }
 
-    // if we still haven't got a response to our last probe, lets give up on it
-    // and send a new probe
-    if (state->last_probe_type != UNPROBED) {
-      trinarkular_log("INFO: re-probing /24 with last_probe_type of %d",
-                      state->last_probe_type);
-      state->last_probe_type = UNPROBED;
-    }
+    // one periodic probe per protocol this /24 has hosts for
+    for (proto = 0; proto < TRINARKULAR_PROBE_PROTO_CNT; proto++) {
+      if (!signal_applies(s24, ACTIVE_SIGNALS(prober), proto)) {
+        continue;
+      }
+      sig_state = &state->sig[proto];
 
-    // reset the probe budgets
-    ADAPTIVE_BUDGET_SET(state, TRINARKULAR_PROBER_ROUND_PROBE_BUDGET);
-    RECOVERY_BUDGET_SET(state, AEB_TO_RECOVERY(s24));
-    if (BELIEF_STATE(state->current_belief) == UP) {
-      state->rounds_since_up = 0;
-    } else {
-      if (state->rounds_since_up < 255) {
-        state->rounds_since_up++;
+      // if we still haven't got a response to our last probe, lets give up on
+      // it and send a new probe
+      if (sig_state->last_probe_type != UNPROBED) {
+        trinarkular_log("INFO: re-probing /24 (%s) with last_probe_type of %d",
+                        proto_names[proto], sig_state->last_probe_type);
+        sig_state->last_probe_type = UNPROBED;
+      }
+
+      // reset the probe budgets
+      ADAPTIVE_BUDGET_SET(sig_state, TRINARKULAR_PROBER_ROUND_PROBE_BUDGET);
+      RECOVERY_BUDGET_SET(sig_state, AEB_TO_RECOVERY(s24->proto[proto].aeb));
+      if (BELIEF_STATE(sig_state->current_belief) == UP) {
+        sig_state->rounds_since_up = 0;
       } else {
-        state->rounds_since_up = RECOVERY_BACKOFF_MAX;
+        if (sig_state->rounds_since_up < 255) {
+          sig_state->rounds_since_up++;
+        } else {
+          sig_state->rounds_since_up = RECOVERY_BACKOFF_MAX;
+        }
+      }
+      // queue a probe to a random host
+      if (queue_slash24_probe(prober, s24, state, proto, PERIODIC) != 0) {
+        return -1;
+      }
+      if (proto == TRINARKULAR_PROBE_PROTO_ICMP) {
+        state->probes_sent ++;
       }
     }
-    // queue a probe to a random host
-    if (queue_slash24_probe(prober, s24, state, PERIODIC) != 0) {
-      return -1;
-    }
-    state->probes_sent ++;
     queued_cnt++;
   }
 
@@ -1161,12 +1291,12 @@ done:
 }
 
 // update the bayesian model given a positive (1) or negative (0) probe response
-static float update_bayesian_belief(trinarkular_slash24_t *s24,
-                                    trinarkular_slash24_state_t *state,
+// to a probe whose protocol has response rate aeb (A(E(b)))
+static float update_bayesian_belief(float aeb, float current_belief,
                                     int probe_response)
 {
   // B(U)
-  float BU = state->current_belief;
+  float BU = current_belief;
 
   // B(~U)
   float BD = 1.0 - BU;
@@ -1175,7 +1305,7 @@ static float update_bayesian_belief(trinarkular_slash24_t *s24,
   float PpD = (1.0 - PACKET_LOSS_FREQUENCY) / TRINARKULAR_SLASH24_HOST_CNT;
 
   // P(p|U)
-  float PpU = s24->aeb;
+  float PpU = aeb;
 
   // P(n|U)
   float PnU = 1.0 - PpU;
@@ -1208,6 +1338,82 @@ static float update_bayesian_belief(trinarkular_slash24_t *s24,
    (BELIEF_STATE(old) == UP && (old > new)) ||                                 \
    (BELIEF_STATE(old) == DOWN && (new > old)))
 
+/** Record a signal's new stable state: per-/24 belief and state series, and
+ * the per-state /24 counts */
+static void update_signal_state(trinarkular_prober_t *prober,
+                                trinarkular_slash24_state_t *state, int sig,
+                                float new_belief_up)
+{
+  trinarkular_signal_state_t *sig_state = &state->sig[sig];
+  trinarkular_slash24_metrics_t *metrics =
+    &state->metrics[sig * state->metrics_cnt];
+  uint64_t tmp;
+  int key;
+  int i;
+
+  // update overall belief stats
+  // decrement current state
+  ACTIVE_STAT(slash24_state_cnts[sig][sig_state->current_state])--;
+  // increment new state
+  ACTIVE_STAT(slash24_state_cnts[sig][BELIEF_STATE(new_belief_up)])++;
+
+  // update the timeseries
+  for (i = 0; i < state->metrics_cnt; i++) {
+    if (metrics[i].belief != -1) {
+      timeseries_kp_set(ACTIVE_KP_SLASH24(prober), metrics[i].belief,
+                        new_belief_up * 100);
+    }
+    if (metrics[i].state != -1) {
+      timeseries_kp_set(ACTIVE_KP_SLASH24(prober), metrics[i].state,
+                        BELIEF_STATE(new_belief_up));
+    }
+
+    // update the overall stats for this metric
+    // decrement the old state
+    key = metrics[i].overall[sig_state->current_state];
+    tmp = timeseries_kp_get(ACTIVE_KP_AGGR(prober), key);
+    assert(tmp > 0);
+    timeseries_kp_set(ACTIVE_KP_AGGR(prober), key, tmp - 1);
+    // increment the new state
+    key = metrics[i].overall[BELIEF_STATE(new_belief_up)];
+    tmp = timeseries_kp_get(ACTIVE_KP_AGGR(prober), key);
+    timeseries_kp_set(ACTIVE_KP_AGGR(prober), key, tmp + 1);
+  }
+
+  // update the stable state
+  sig_state->current_state = BELIEF_STATE(new_belief_up);
+}
+
+/** Feed a response into the combined signal (decision 1.2 (a1)): one belief,
+ * updated by every protocol's responses, each using its own protocol's
+ * A(E(b)) as P(response | up). The combined signal sends no probes of its own;
+ * it settles once no protocol is still probing the /24. */
+static void update_combined_signal(trinarkular_prober_t *prober,
+                                   trinarkular_slash24_t *s24,
+                                   trinarkular_slash24_state_t *state,
+                                   int proto, int verdict)
+{
+  trinarkular_signal_state_t *comb = &state->sig[TRINARKULAR_SIGNAL_COMBINED];
+  int p;
+
+  if (!signal_applies(s24, ACTIVE_SIGNALS(prober),
+                      TRINARKULAR_SIGNAL_COMBINED)) {
+    return;
+  }
+
+  comb->current_belief = update_bayesian_belief(
+    s24->proto[proto].aeb, comb->current_belief, verdict);
+
+  for (p = 0; p < TRINARKULAR_PROBE_PROTO_CNT; p++) {
+    if (state->sig[p].last_probe_type != UNPROBED) {
+      return; // still converging
+    }
+  }
+
+  update_signal_state(prober, state, TRINARKULAR_SIGNAL_COMBINED,
+                      comb->current_belief);
+}
+
 static int handle_driver_resp(zloop_t *loop, zsock_t *reader, void *arg)
 {
   struct driver_wrap *dw = (struct driver_wrap *)arg;
@@ -1215,10 +1421,9 @@ static int handle_driver_resp(zloop_t *loop, zsock_t *reader, void *arg)
   trinarkular_probe_resp_t resp;
   trinarkular_slash24_t *s24 = NULL;
   trinarkular_slash24_state_t *state = NULL;
+  trinarkular_signal_state_t *sig_state = NULL;
   float new_belief_up;
-  int i;
-  uint64_t tmp;
-  int key;
+  int proto;
 
   CHECK_SHUTDOWN;
 
@@ -1245,38 +1450,54 @@ static int handle_driver_resp(zloop_t *loop, zsock_t *reader, void *arg)
     goto err;
   }
 
+  // the response says which protocol it answers, so ICMP and TCP probes
+  // outstanding to the same /24 at once are attributed correctly
+  proto = resp.proto;
+  if (proto >= TRINARKULAR_PROBE_PROTO_CNT ||
+      !signal_applies(s24, ACTIVE_SIGNALS(prober), proto)) {
+    trinarkular_log("WARN: Response for %x with unexpected protocol %d",
+                    ntohl(resp.target_ip), proto);
+    return 0;
+  }
+  sig_state = &state->sig[proto];
+
   // since periodic probing will reset adaptive probing state, this can cause
   // responses to become out of sync. simply ignore a response that we don't
   // care about. (NB: in practice this should rarely, if ever, happen since a
   // round is much longer than the timeout)
-  if (state->last_probe_type == UNPROBED) {
+  if (sig_state->last_probe_type == UNPROBED) {
     return 0;
   }
 
-  if (resp.verdict == TRINARKULAR_PROBE_RESPONSIVE) {
+  // latency/loss series are ICMP only, as before protocols existed
+  if (proto == TRINARKULAR_PROBE_PROTO_ICMP &&
+      resp.verdict == TRINARKULAR_PROBE_RESPONSIVE) {
       state->replies_seen ++;
       state->cumulative_rtt += resp.rtt;
   }
 
   // update the overall per-round statistics
-  ACTIVE_STAT(probe_complete_cnt[state->last_probe_type])++;
-  ACTIVE_STAT(responsive_cnt[state->last_probe_type]) += resp.verdict;
+  ACTIVE_STAT(probe_complete_cnt[proto][sig_state->last_probe_type])++;
+  ACTIVE_STAT(responsive_cnt[proto][sig_state->last_probe_type]) +=
+    resp.verdict;
 
-  new_belief_up = update_bayesian_belief(s24, state, resp.verdict);
+  new_belief_up = update_bayesian_belief(
+    s24->proto[proto].aeb, sig_state->current_belief, resp.verdict);
 
 #ifdef DEBUG_PROBING
-  fprintf(stdout, "%f (%s) -> %f (%s)", state->current_belief,
-          belief_icons[BELIEF_STATE(state->current_belief)], new_belief_up,
+  fprintf(stdout, "%s %f (%s) -> %f (%s)", proto_names[proto],
+          sig_state->current_belief,
+          belief_icons[BELIEF_STATE(sig_state->current_belief)], new_belief_up,
           belief_icons[BELIEF_STATE(new_belief_up)]);
 #endif
 
   // if new state is uncertain, or we are moving toward uncertainty, send more
   // probes
-  if (BECOMING_UNCERTAIN(state->current_belief, new_belief_up)) {
+  if (BECOMING_UNCERTAIN(sig_state->current_belief, new_belief_up)) {
     // we'd like to send an adaptive probe, but do we have any left in the
     // budget?
-    if (ADAPTIVE_BUDGET(state) > 0) {
-      if (queue_slash24_probe(prober, s24, state, ADAPTIVE) != 0) {
+    if (ADAPTIVE_BUDGET(sig_state) > 0) {
+      if (queue_slash24_probe(prober, s24, state, proto, ADAPTIVE) != 0) {
         return -1;
       }
 #ifdef DEBUG_PROBING
@@ -1289,10 +1510,11 @@ static int handle_driver_resp(zloop_t *loop, zsock_t *reader, void *arg)
       // no more adaptive probes left, but if we are changing state away from
       // UP, we'd better be darn sure, so lets switch to recovery probing right
       // now (unless this is the first round...)
-    } else if (state->current_state == UP && RECOVERY_BUDGET(state) > 0 &&
+    } else if (sig_state->current_state == UP &&
+               RECOVERY_BUDGET(sig_state) > 0 &&
                prober->current_slice != 0) {
       // queue a recovery probe
-      if (queue_slash24_probe(prober, s24, state, RECOVERY) != 0) {
+      if (queue_slash24_probe(prober, s24, state, proto, RECOVERY) != 0) {
         return -1;
       }
 #ifdef DEBUG_PROBING
@@ -1307,7 +1529,7 @@ static int handle_driver_resp(zloop_t *loop, zsock_t *reader, void *arg)
       if (BELIEF_STATE(new_belief_up) != UNCERTAIN) {
         new_belief_up = 0.5; // => UNCERTAIN
       }
-      state->last_probe_type = UNPROBED;
+      sig_state->last_probe_type = UNPROBED;
 #ifdef DEBUG_PROBING
       fprintf(stdout, " DONE-ADAPTIVE");
 #endif
@@ -1315,12 +1537,12 @@ static int handle_driver_resp(zloop_t *loop, zsock_t *reader, void *arg)
 
     // otherwise, if we are down and staying down, send recovery probes to try
     // and get back up.
-  } else if (BELIEF_STATE(state->current_belief) == DOWN &&
+  } else if (BELIEF_STATE(sig_state->current_belief) == DOWN &&
              BELIEF_STATE(new_belief_up) == DOWN &&
-             RECOVERY_ELIGIBLE(state) != 0 &&
-             RECOVERY_BUDGET(state) > 0) {
+             RECOVERY_ELIGIBLE(sig_state) != 0 &&
+             RECOVERY_BUDGET(sig_state) > 0) {
     // queue a recovery probe
-    if (queue_slash24_probe(prober, s24, state, RECOVERY) != 0) {
+    if (queue_slash24_probe(prober, s24, state, proto, RECOVERY) != 0) {
       return -1;
     }
 #ifdef DEBUG_PROBING
@@ -1329,56 +1551,29 @@ static int handle_driver_resp(zloop_t *loop, zsock_t *reader, void *arg)
 
   } else {
     // No adaptive/recovery probe sent
-    state->last_probe_type = UNPROBED;
+    sig_state->last_probe_type = UNPROBED;
 #ifdef DEBUG_PROBING
     fprintf(stdout, " DONE");
 #endif
   }
 
 #ifdef DEBUG_PROBING
-  fprintf(stdout, " %d %d %d\n", ADAPTIVE_BUDGET(state), RECOVERY_BUDGET(state),
-          state->rounds_since_up);
+  fprintf(stdout, " %d %d %d\n", ADAPTIVE_BUDGET(sig_state),
+          RECOVERY_BUDGET(sig_state), sig_state->rounds_since_up);
 #endif
 
   // only update statistics if we have stopped probing this /24 (otherwise we
   // run the risk of dumping info about a /24 while the prober is converging on
   // a decision)
-  if (state->last_probe_type == UNPROBED) {
-    // update overall belief stats
-    // decrement current state
-    ACTIVE_STAT(slash24_state_cnts[state->current_state])--;
-    // increment new state
-    ACTIVE_STAT(slash24_state_cnts[BELIEF_STATE(new_belief_up)])++;
-
-    // update the timeseries
-    for (i = 0; i < state->metrics_cnt; i++) {
-      if (state->metrics[i].belief != -1) {
-        timeseries_kp_set(ACTIVE_KP_SLASH24(prober), state->metrics[i].belief,
-                          new_belief_up * 100);
-      }
-      if (state->metrics[i].state != -1) {
-        timeseries_kp_set(ACTIVE_KP_SLASH24(prober), state->metrics[i].state,
-                          BELIEF_STATE(new_belief_up));
-      }
-
-      // update the overall stats for this metric
-      // decrement the old state
-      key = state->metrics[i].overall[state->current_state];
-      tmp = timeseries_kp_get(ACTIVE_KP_AGGR(prober), key);
-      assert(tmp > 0);
-      timeseries_kp_set(ACTIVE_KP_AGGR(prober), key, tmp - 1);
-      // increment the new state
-      key = state->metrics[i].overall[BELIEF_STATE(new_belief_up)];
-      tmp = timeseries_kp_get(ACTIVE_KP_AGGR(prober), key);
-      timeseries_kp_set(ACTIVE_KP_AGGR(prober), key, tmp + 1);
-    }
-
-    // update the stable state
-    state->current_state = BELIEF_STATE(new_belief_up);
+  if (sig_state->last_probe_type == UNPROBED) {
+    update_signal_state(prober, state, proto, new_belief_up);
   }
 
   // update the belief
-  state->current_belief = new_belief_up;
+  sig_state->current_belief = new_belief_up;
+
+  // and the combined signal, after this protocol's probing state is final
+  update_combined_signal(prober, s24, state, proto, resp.verdict);
 
   return 0;
 

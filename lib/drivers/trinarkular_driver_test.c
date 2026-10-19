@@ -267,6 +267,8 @@ static int handle_resp_timer(zloop_t *loop, int timer_id, void *arg)
 #endif
 
     resp.target_ip = rw->req.target_ip;
+    resp.proto = rw->req.proto;
+    resp.port = rw->req.port;
     // resp.rtt = rw->rtt;
     // resp.probes_sent = rw->probe_tx;
 

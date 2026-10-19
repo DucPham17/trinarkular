@@ -165,6 +165,8 @@ int main(int argc, char **argv)
 
   // set defaults for the request
   req.wait = WAIT;
+  req.proto = TRINARKULAR_PROBE_PROTO_ICMP;
+  req.port = 0;
 
   while (prevoptind = optind,
          (opt = getopt(argc, argv, ":c:d:f:i:l:t:v?")) >= 0) {

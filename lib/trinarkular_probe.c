@@ -59,8 +59,10 @@ void trinarkular_probe_req_fprint(FILE *fh, trinarkular_probe_req_t *req)
   fprintf(fh, "----- REQUEST -----\n");
   fprintf(fh, "target-ip:\t%s (%x)\n"
               "wait:\t%d\n"
+              "proto:\t%d\n"
+              "port:\t%d\n"
               "-------------------\n\n",
-          ipbuf, ntohl(req->target_ip), req->wait);
+          ipbuf, ntohl(req->target_ip), req->wait, req->proto, req->port);
 }
 
 void trinarkular_probe_resp_fprint(FILE *fh, trinarkular_probe_resp_t *resp)
@@ -71,9 +73,11 @@ void trinarkular_probe_resp_fprint(FILE *fh, trinarkular_probe_resp_t *resp)
               "target-ip:\t%s (%x)\n"
               "verdict:\t%s\n"
               "rtt:\t%" PRIu32 "\n"
+              "proto:\t%d\n"
+              "port:\t%d\n"
               "-------------------\n\n",
           ipbuf, ntohl(resp->target_ip),
           (resp->verdict == TRINARKULAR_PROBE_RESPONSIVE) ? "responsive"
           : "unresponsive",
-          resp->rtt);
+          resp->rtt, resp->proto, resp->port);
 }

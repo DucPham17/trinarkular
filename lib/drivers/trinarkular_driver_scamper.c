@@ -68,6 +68,7 @@
 #include <scamper_addr.h>
 #include <scamper_dealias.h>
 #include <scamper_file.h>
+#include <scamper_ping.h>
 #include <scamper_linepoll.h>
 #include <scamper_writebuf.h>
 
@@ -100,6 +101,16 @@ extern int string_tolong(const char *str, long *l);
 #define MAX_REQ_PER_COMMAND 10000
 
 #define DEFAULT_PROBE_METHOD "icmp-echo"
+#define DEFAULT_TCP_PROBE_METHOD "tcp-syn-sport"
+
+// how often (ms) to send queued requests that have not filled a batch
+#define FLUSH_INTERVAL_MS 1000
+
+// the scamper userid of a command carries the protocol and port of its
+// requests, so they can be put back on the responses
+#define USERID_MAKE(proto, port) (((uint32_t)(proto) << 16) | (port))
+#define USERID_PROTO(userid) ((uint8_t)((userid) >> 16))
+#define USERID_PORT(userid) ((uint16_t)((userid)&0xFFFF))
 
 #define CMD_BUF_LEN (256 + (MAX_REQ_PER_COMMAND * (INET_ADDRSTRLEN + 1)))
 
@@ -115,9 +126,13 @@ typedef struct scamper_driver {
   uint16_t port;
   // unix socket for remote controlled scamper
   char *unix_socket;
-  // radargun probe method (scamper -P) and destination port (-d, 0 = unset)
+  // probe method (scamper -P) and destination port (-d, 0 = unset) for ICMP
+  // requests. (-m/-d can point the "ICMP" signal of a legacy probelist at
+  // another method)
   char *probe_method;
   uint16_t probe_dport;
+  // probe method for TCP requests (the port comes from the request)
+  char *tcp_probe_method;
 
   // list of queued requests
   trinarkular_probe_req_t req_queue[REQ_QUEUE_LEN];
@@ -270,82 +285,111 @@ static int decode_out_writebuf_send_wrap(trinarkular_driver_t *drv, void *data,
   return 0;
 }
 
-static int send_req(trinarkular_driver_t *drv)
+/** Does this request go in the same scamper command as the given one? */
+static int req_batchable(trinarkular_probe_req_t *a, trinarkular_probe_req_t *b)
 {
+  return a->proto == b->proto && a->port == b->port && a->wait == b->wait;
+}
+
+/** Send one scamper command for the request at the head of the queue and
+ * every other queued request with the same protocol, port and wait (up to the
+ * batch size). Unless flush is set, waits for a full batch's worth of queued
+ * requests. Returns the number of requests sent. */
+static int send_req(trinarkular_driver_t *drv, int flush)
+{
+  trinarkular_probe_req_t head;
   trinarkular_probe_req_t *req;
   char cmd[CMD_BUF_LEN];
   char probedef[64];
+  const char *method;
+  uint16_t dport;
+  uint32_t userid;
   size_t len;
   int targets_added = 0;
-
-  uint16_t wait;
+  int r, w, k, cnt, kept = 0;
+  char prefix[256];
+  int plen;
 
   assert(MY(drv)->more > 0);
 
-  if (MY(drv)->req_queue_cnt < MY(drv)->req_per_command) {
+  if (MY(drv)->req_queue_cnt == 0 ||
+      (flush == 0 && MY(drv)->req_queue_cnt < MY(drv)->req_per_command)) {
     return 0;
   }
 
   // build scamper command (grab the config from the first request)
-  req = &MY(drv)->req_queue[MY(drv)->req_queue_next_idx];
-  wait = req->wait;
-  if (MY(drv)->probe_dport != 0) {
-    snprintf(probedef, sizeof(probedef), "-P %s -d %u", MY(drv)->probe_method,
-             MY(drv)->probe_dport);
+  head = MY(drv)->req_queue[MY(drv)->req_queue_next_idx];
+  if (head.proto == TRINARKULAR_PROBE_PROTO_TCP) {
+    method = MY(drv)->tcp_probe_method;
+    dport = head.port;
   } else {
-    snprintf(probedef, sizeof(probedef), "-P %s", MY(drv)->probe_method);
+    method = MY(drv)->probe_method;
+    dport = MY(drv)->probe_dport;
   }
-  if ((len =
-         snprintf(cmd, CMD_BUF_LEN, "dealias -m radargun -p \"%s\" "
-                                    "-w %d -q 1 -W 1",
-                  probedef, wait)) >= CMD_BUF_LEN) {
+  if (dport != 0) {
+    snprintf(probedef, sizeof(probedef), "-P %s -d %u", method, dport);
+  } else {
+    snprintf(probedef, sizeof(probedef), "-P %s", method);
+  }
+  userid = USERID_MAKE(head.proto, head.port);
+
+  // pull the matching requests out of the queue, sliding the others up so
+  // they keep their order
+  len = 0;
+  r = w = MY(drv)->req_queue_next_idx;
+  cnt = MY(drv)->req_queue_cnt;
+  for (k = 0; k < cnt; k++) {
+    req = &MY(drv)->req_queue[r];
+    r = (r + 1) % REQ_QUEUE_LEN;
+
+    if (targets_added < MY(drv)->req_per_command &&
+        req_batchable(req, &head)) {
+      // add IP to the target list (at the end of cmd for now)
+      if (CMD_BUF_LEN - 256 - len < 1 + INET_ADDRSTRLEN) {
+        trinarkular_log("ERROR: Could not convert IP address to string");
+        return -1;
+      }
+      cmd[256 + len] = ' ';
+      len++;
+      if (inet_ntop(AF_INET, &req->target_ip, &cmd[256 + len],
+                    INET_ADDRSTRLEN) == NULL) {
+        trinarkular_log("ERROR: Could not convert IP address to string");
+        return -1;
+      }
+      len += strlen(&cmd[256 + len]);
+      targets_added++;
+      continue;
+    }
+
+    if (&MY(drv)->req_queue[w] != req) {
+      MY(drv)->req_queue[w] = *req;
+    }
+    w = (w + 1) % REQ_QUEUE_LEN;
+    kept++;
+  }
+  MY(drv)->req_queue_last_idx = w;
+  MY(drv)->req_queue_cnt = kept;
+
+  // radargun needs at least two addresses, so a lone target is a ping
+  if (targets_added == 1) {
+    plen = snprintf(prefix, sizeof(prefix), "ping %s -c 1 -W %d -U %u",
+                    probedef, head.wait, userid);
+  } else {
+    plen = snprintf(prefix, sizeof(prefix),
+                    "dealias -m radargun -U %u -p \"%s\" -w %d -q 1 -W 1",
+                    userid, probedef, head.wait);
+  }
+  if (plen < 0 || plen >= (int)sizeof(prefix) ||
+      CMD_BUF_LEN - 256 - len < 2) {
     trinarkular_log("ERROR: Could not build scamper command");
     return -1;
   }
-
-  // pop a req from the queue up to our limit and build a scamper command
-  while (MY(drv)->req_queue_cnt > 0 &&
-         targets_added < MY(drv)->req_per_command) {
-
-    req = &MY(drv)->req_queue[MY(drv)->req_queue_next_idx];
-
-    // if this request has different parameters to the previous, then we can't
-    // batch it together
-    if (req->wait != wait) {
-      trinarkular_log("WARN: Stopping batch due to mismatched params");
-      break;
-    }
-
-    MY(drv)->req_queue_next_idx =
-      (MY(drv)->req_queue_next_idx + 1) % REQ_QUEUE_LEN;
-    MY(drv)->req_queue_cnt--;
-
-    // add IP to scamper command
-    if (CMD_BUF_LEN - len < 1 + INET_ADDRSTRLEN) {
-      trinarkular_log("ERROR: Could not convert IP address to string");
-      return -1;
-    }
-
-    cmd[len] = ' ';
-    len++;
-    if (inet_ntop(AF_INET, &req->target_ip, &cmd[len], INET_ADDRSTRLEN) ==
-        NULL) {
-      trinarkular_log("ERROR: Could not convert IP address to string");
-      return -1;
-    }
-
-    while (cmd[len] != '\0') {
-      len++;
-    }
-
-    targets_added++;
-  }
+  // the targets are at cmd+256; put the command in front of them
+  memmove(&cmd[plen], &cmd[256], len);
+  memcpy(cmd, prefix, plen);
+  len += plen;
 
   // add newline
-  if (CMD_BUF_LEN - len < 2) {
-    trinarkular_log("ERROR: Could not build scamper command");
-    return -1;
-  }
   cmd[len] = '\n';
   len++;
   cmd[len] = '\0';
@@ -360,6 +404,22 @@ static int send_req(trinarkular_driver_t *drv)
   MY(drv)->more--;
 
   return targets_added;
+}
+
+/** Send everything scamper has room for, partial batches included */
+static int handle_flush_timer(zloop_t *loop, int timer_id, void *arg)
+{
+  trinarkular_driver_t *drv = (trinarkular_driver_t *)arg;
+  int cnt;
+
+  while (MY(drv)->more > 0) {
+    if ((cnt = send_req(drv, 1)) < 0) {
+      return -1;
+    } else if (cnt == 0) {
+      break;
+    }
+  }
+  return 0;
 }
 
 static int handle_scamperread_line(void *param, uint8_t *buf, size_t linelen)
@@ -398,7 +458,7 @@ static int handle_scamperread_line(void *param, uint8_t *buf, size_t linelen)
   /* if the scamper process is asking for more tasks, give it more */
   if (linelen == 4 && strncasecmp(head, "MORE", linelen) == 0) {
     MY(drv)->more++;
-    if (send_req(drv) < 0) {
+    if (send_req(drv, 0) < 0) {
       return -1;
     }
     return 0;
@@ -426,22 +486,94 @@ static int handle_scamperread_line(void *param, uint8_t *buf, size_t linelen)
   return -1;
 }
 
+/** Yield the response for one dealias probe */
+static int dealias_probe_resp(trinarkular_driver_t *drv,
+                              scamper_dealias_probe_t *probe,
+                              trinarkular_probe_resp_t *resp)
+{
+  scamper_dealias_probedef_t *def;
+  scamper_dealias_reply_t *reply;
+  scamper_addr_t *addr;
+  struct timeval rtt;
+  uint64_t rtt_tmp;
+  int j;
+
+  def = scamper_dealias_probe_def_get(probe);
+
+  addr = scamper_dealias_probedef_dst_get(def);
+  assert(scamper_addr_type_get(addr) == SCAMPER_ADDR_TYPE_IPV4);
+  memcpy(&resp->target_ip, scamper_addr_addr_get(addr), sizeof(uint32_t));
+
+  resp->rtt = 0;
+
+  resp->verdict = TRINARKULAR_PROBE_UNRESPONSIVE;
+  // look for the first responsive reply
+  for (j = 0; j < scamper_dealias_probe_replyc_get(probe); j++) {
+    reply = scamper_dealias_probe_reply_get(probe, j);
+    if (reply != NULL && scamper_dealias_reply_from_target(probe, reply)) {
+      resp->verdict = TRINARKULAR_PROBE_RESPONSIVE;
+      timeval_subtract(&rtt, scamper_dealias_reply_rx_get(reply),
+              scamper_dealias_probe_tx_get(probe));
+      rtt_tmp = TV_TO_MS(rtt);
+      assert(rtt_tmp < UINT32_MAX);
+      resp->rtt = rtt_tmp;
+      break;
+    }
+  }
+
+  // yield this response to the user thread
+  return trinarkular_driver_yield_resp(drv, resp);
+}
+
+/** Yield the response for a single-target ping */
+static int ping_resp(trinarkular_driver_t *drv, scamper_ping_t *ping,
+                     trinarkular_probe_resp_t *resp)
+{
+  scamper_ping_reply_t *reply;
+  scamper_addr_t *addr;
+  const struct timeval *rtt;
+  uint64_t rtt_tmp;
+  int i;
+
+  addr = scamper_ping_dst_get(ping);
+  assert(scamper_addr_type_get(addr) == SCAMPER_ADDR_TYPE_IPV4);
+  memcpy(&resp->target_ip, scamper_addr_addr_get(addr), sizeof(uint32_t));
+
+  resp->rtt = 0;
+
+  resp->verdict = TRINARKULAR_PROBE_UNRESPONSIVE;
+  // look for the first responsive reply
+  for (i = 0; i < scamper_ping_sent_get(ping) &&
+              resp->verdict == TRINARKULAR_PROBE_UNRESPONSIVE; i++) {
+    for (reply = scamper_ping_reply_get(ping, i); reply != NULL;
+         reply = scamper_ping_reply_next_get(reply)) {
+      if (scamper_ping_reply_is_from_target(ping, reply)) {
+        resp->verdict = TRINARKULAR_PROBE_RESPONSIVE;
+        rtt = scamper_ping_reply_rtt_get(reply);
+        rtt_tmp = TV_TO_MS((*rtt));
+        assert(rtt_tmp < UINT32_MAX);
+        resp->rtt = rtt_tmp;
+        break;
+      }
+    }
+  }
+
+  return trinarkular_driver_yield_resp(drv, resp);
+}
+
 static int handle_decode_in_fd_read(zloop_t *loop, zmq_pollitem_t *pi,
                                     void *arg)
 {
+  trinarkular_driver_t *drv = (trinarkular_driver_t *)arg;
   void *data;
   uint16_t type;
   scamper_dealias_t *dealias;
-  scamper_dealias_probedef_t *def;
-  scamper_dealias_probe_t *probe;
-  scamper_dealias_reply_t *reply;
-  scamper_addr_t *addr;
+  scamper_ping_t *ping;
   trinarkular_probe_resp_t resp;
-  struct timeval rtt;
-  uint64_t rtt_tmp;
-  int i, j;
+  uint32_t userid;
+  int i;
 
-  /* try and read a ping from the warts decoder */
+  /* try and read a result from the warts decoder */
   if (scamper_file_read(MY(arg)->decode_in, MY(arg)->ffilter, &type, &data) !=
       0) {
     trinarkular_log("ERROR: scamper_file_read errno %d", errno);
@@ -452,40 +584,32 @@ static int handle_decode_in_fd_read(zloop_t *loop, zmq_pollitem_t *pi,
   }
   MY(arg)->probing_cnt--;
 
+  memset(&resp, 0, sizeof(resp));
+
+  if (type == SCAMPER_FILE_OBJ_PING) {
+    ping = (scamper_ping_t *)data;
+    userid = scamper_ping_userid_get(ping);
+    resp.proto = USERID_PROTO(userid);
+    resp.port = USERID_PORT(userid);
+    if (ping_resp(drv, ping, &resp) != 0) {
+      return -1;
+    }
+    scamper_ping_free(ping);
+    return 0;
+  }
+
   assert(type == SCAMPER_FILE_OBJ_DEALIAS);
 
   dealias = (scamper_dealias_t *)data;
   assert(scamper_dealias_method_get(dealias) ==
           SCAMPER_DEALIAS_METHOD_RADARGUN);
+  userid = scamper_dealias_userid_get(dealias);
+  resp.proto = USERID_PROTO(userid);
+  resp.port = USERID_PORT(userid);
 
   for (i = 0; i < scamper_dealias_probec_get(dealias); i++) {
-    probe = scamper_dealias_probe_get(dealias, i);
-    def = scamper_dealias_probe_def_get(probe);
-
-    addr = scamper_dealias_probedef_dst_get(def);
-    assert(scamper_addr_type_get(addr) == SCAMPER_ADDR_TYPE_IPV4);
-    memcpy(&resp.target_ip, scamper_addr_addr_get(addr), sizeof(uint32_t));
-
-    resp.rtt = 0;
-
-    resp.verdict = TRINARKULAR_PROBE_UNRESPONSIVE;
-    // look for the first responsive reply
-    for (j = 0; j < scamper_dealias_probe_replyc_get(probe); j++) {
-      reply = scamper_dealias_probe_reply_get(probe, j);
-      if (reply != NULL && scamper_dealias_reply_from_target(probe, reply)) {
-        resp.verdict = TRINARKULAR_PROBE_RESPONSIVE;
-        timeval_subtract(&rtt, scamper_dealias_reply_rx_get(reply),
-                scamper_dealias_probe_tx_get(probe));
-        rtt_tmp = TV_TO_MS(rtt);
-        assert(rtt_tmp < UINT32_MAX);
-        resp.rtt = rtt_tmp;
-        break;
-      }
-    }
-
-    // yield this response to the user thread
-    if (trinarkular_driver_yield_resp((trinarkular_driver_t *)arg, &resp) !=
-        0) {
+    if (dealias_probe_resp(drv, scamper_dealias_probe_get(dealias, i),
+                           &resp) != 0) {
       return -1;
     }
   }
@@ -553,12 +677,13 @@ static void usage(char *name)
     stderr,
     "Driver usage: %s [options] [-p|-R]\n"
     "       -b <cnt>       batch size for radargun batches (default: %d)\n"
-    "       -d <dport>     destination port for TCP/UDP probe methods\n"
-    "       -m <method>    radargun probe method, e.g. tcp-syn-sport "
-    "(default: %s)\n"
+    "       -d <dport>     destination port for -m, if a TCP/UDP method\n"
+    "       -m <method>    probe method for ICMP requests (default: %s)\n"
+    "       -T <method>    probe method for TCP requests (default: %s)\n"
     "       -p <port>      port to find scamper on\n"
     "       -R <unix>      unix domain socket for remote controlled scamper\n",
-    name, DEFAULT_REQ_PER_COMMAND, DEFAULT_PROBE_METHOD);
+    name, DEFAULT_REQ_PER_COMMAND, DEFAULT_PROBE_METHOD,
+    DEFAULT_TCP_PROBE_METHOD);
 }
 
 static int parse_args(trinarkular_driver_t *drv, int argc, char **argv)
@@ -569,7 +694,7 @@ static int parse_args(trinarkular_driver_t *drv, int argc, char **argv)
   int port_set = 0;
 
   optind = 1;
-  while (prevoptind = optind, (opt = getopt(argc, argv, ":b:d:m:p:R:?")) >= 0) {
+  while (prevoptind = optind, (opt = getopt(argc, argv, ":b:d:m:p:R:T:?")) >= 0) {
     if (optind == prevoptind + 2 && optarg && *optarg == '-' &&
         *(optarg + 1) != '\0') {
       opt = ':';
@@ -588,6 +713,12 @@ static int parse_args(trinarkular_driver_t *drv, int argc, char **argv)
       free(MY(drv)->probe_method);
       MY(drv)->probe_method = strdup(optarg);
       assert(MY(drv)->probe_method != NULL);
+      break;
+
+    case 'T':
+      free(MY(drv)->tcp_probe_method);
+      MY(drv)->tcp_probe_method = strdup(optarg);
+      assert(MY(drv)->tcp_probe_method != NULL);
       break;
 
     case 'p':
@@ -657,12 +788,14 @@ int trinarkular_driver_scamper_init(trinarkular_driver_t *drv, int argc,
                                     char **argv)
 {
   int pair[2];
-  uint16_t types[] = {SCAMPER_FILE_OBJ_DEALIAS};
-  int typec = 1;
+  uint16_t types[] = {SCAMPER_FILE_OBJ_DEALIAS, SCAMPER_FILE_OBJ_PING};
+  int typec = 2;
 
   MY(drv)->req_per_command = DEFAULT_REQ_PER_COMMAND;
   MY(drv)->probe_method = strdup(DEFAULT_PROBE_METHOD);
   assert(MY(drv)->probe_method != NULL);
+  MY(drv)->tcp_probe_method = strdup(DEFAULT_TCP_PROBE_METHOD);
+  assert(MY(drv)->tcp_probe_method != NULL);
 
   if (parse_args(drv, argc, argv) != 0) {
     return -1;
@@ -756,6 +889,7 @@ void trinarkular_driver_scamper_destroy(trinarkular_driver_t *drv)
 
   free(MY(drv)->unix_socket);
   free(MY(drv)->probe_method);
+  free(MY(drv)->tcp_probe_method);
   MY(drv)->unix_socket = NULL;
 }
 
@@ -803,6 +937,13 @@ int trinarkular_driver_scamper_init_thr(trinarkular_driver_t *drv)
   }
   MY(drv)->decode_out_pollout_active = 1;
 
+  // send partial batches that would otherwise wait for more requests
+  if (zloop_timer(TRINARKULAR_DRIVER_ZLOOP(drv), FLUSH_INTERVAL_MS, 0,
+                  handle_flush_timer, drv) < 0) {
+    trinarkular_log("ERROR: Could not add flush timer to event loop");
+    return -1;
+  }
+
   // attach to scamper
   scamper_writebuf_send_wrap(drv, "attach\n", 7);
 
@@ -836,7 +977,7 @@ int trinarkular_driver_scamper_handle_req(trinarkular_driver_t *drv,
 
   // send all the requests that scamper can handle
   while (MY(drv)->more > 0) {
-    if ((cnt = send_req(drv)) < 0) {
+    if ((cnt = send_req(drv, 0)) < 0) {
       return -1;
     } else if (cnt == 0) { // sent nothing, so lets stop
       break;

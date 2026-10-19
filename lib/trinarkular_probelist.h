@@ -45,6 +45,7 @@
 
 #include <stdint.h>
 #include "khash.h"
+#include "trinarkular_probe.h"
 /** @file
  *
  * @brief Header file that exposes the public interface of the trinarkular
@@ -96,17 +97,32 @@ typedef struct trinarkular_slash24_metrics {
 
 } __attribute__((packed)) trinarkular_slash24_metrics_t;
 
-/** Structure representing prober state for a /24
- *
- * NB: When modifying fields here, you MUST also modify the copy_state function
- * in trinarkular_probelist.c
+/** Signals kept for each /24: one per probe protocol, at the same index as
+ * the protocol, plus a combined signal that every protocol's responses feed.
  */
-typedef struct trinarkular_slash24_state {
+typedef enum trinarkular_signal_id {
 
-  /** Index of the current host in the slash24 */
+  TRINARKULAR_SIGNAL_ICMP = TRINARKULAR_PROBE_PROTO_ICMP,
+
+  TRINARKULAR_SIGNAL_TCP = TRINARKULAR_PROBE_PROTO_TCP,
+
+  TRINARKULAR_SIGNAL_COMBINED = TRINARKULAR_PROBE_PROTO_CNT,
+
+  TRINARKULAR_SIGNAL_CNT,
+
+} trinarkular_signal_id_t;
+
+/** Bit for a signal in a mask of signals */
+#define TRINARKULAR_SIGNAL_BIT(sig) (1 << (sig))
+
+/** Belief state for one signal of a /24 */
+typedef struct trinarkular_signal_state {
+
+  /** Index of the current host in this protocol's host list (unused for the
+      combined signal, which sends no probes of its own) */
   uint8_t current_host;
 
-  /** What was the type of the last probe sent to this /24? */
+  /** What was the type of the last probe sent for this signal? */
   uint8_t last_probe_type;
 
   /** The number of additional probes that can be sent this round.
@@ -116,21 +132,36 @@ typedef struct trinarkular_slash24_state {
    */
   uint8_t probe_budget;
 
-  /** The current belief value for this /24 */
+  /** The current belief value */
   float current_belief;
 
-  /** Last stable state for this /24 (Warning: this **may not** match
+  /** Last stable state (Warning: this **may not** match
       BELIEF_STATE(current_belief) if adaptive probing has been used) */
   uint8_t current_state;
 
-  /** How many rounds has it been since this /24 was UP? The value is
+  /** How many rounds has it been since this signal was UP? The value is
       incremented *before* sending a periodic probe. Once the value reaches
       255, it is reset to RECOVERY_BACKOFF_MAX to avoid wrapping */
   uint8_t rounds_since_up;
 
-  /** Set of timeseries associated with this /24 (one per metadata)*/
+} __attribute__((packed)) trinarkular_signal_state_t;
+
+/** Structure representing prober state for a /24
+ *
+ * NB: When modifying fields here, you MUST also modify the copy_state function
+ * in trinarkular_probelist.c
+ */
+typedef struct trinarkular_slash24_state {
+
+  /** Belief state per signal (indexed by trinarkular_signal_id_t) */
+  trinarkular_signal_state_t sig[TRINARKULAR_SIGNAL_CNT];
+
+  /** Set of timeseries associated with this /24: metrics_cnt per signal, so
+      the metrics for signal s and metadata i are at
+      metrics[s * metrics_cnt + i] */
   trinarkular_slash24_metrics_t *metrics;
 
+  /** Latency/loss counters, for ICMP probes only */
   uint64_t cumulative_rtt;
 
   uint32_t probes_sent;
@@ -143,37 +174,48 @@ typedef struct trinarkular_slash24_state {
 
   int32_t probes_kp_index;
 
-  /** Number of metric sets */
+  /** Number of metric sets per signal */
   uint8_t metrics_cnt;
 
 } __attribute__((packed)) trinarkular_slash24_state_t;
 
-#define ADAPTIVE_BUDGET(s24state) ((s24state)->probe_budget & 0x0f)
+#define ADAPTIVE_BUDGET(sigstate) ((sigstate)->probe_budget & 0x0f)
 
-#define ADAPTIVE_BUDGET_SET(s24state, val)                                     \
-  (s24state)->probe_budget = ((s24state)->probe_budget & 0xf0) | ((val)&0x0f)
+#define ADAPTIVE_BUDGET_SET(sigstate, val)                                     \
+  (sigstate)->probe_budget = ((sigstate)->probe_budget & 0xf0) | ((val)&0x0f)
 
-#define RECOVERY_BUDGET(s24state) (((s24state)->probe_budget >> 4) & 0xf)
+#define RECOVERY_BUDGET(sigstate) (((sigstate)->probe_budget >> 4) & 0xf)
 
-#define RECOVERY_BUDGET_SET(s24state, val)                                     \
-  (s24state)->probe_budget =                                                   \
-    ((s24state)->probe_budget & 0x0f) | (((val)&0x0f) << 4)
+#define RECOVERY_BUDGET_SET(sigstate, val)                                     \
+  (sigstate)->probe_budget =                                                   \
+    ((sigstate)->probe_budget & 0x0f) | (((val)&0x0f) << 4)
+
+/** The hosts of a /24 that are probed with one protocol */
+typedef struct trinarkular_slash24_hosts {
+
+  /** List of target host bytes (should be OR'd with the network IP) */
+  uint8_t *hosts;
+
+  /** Destination port of each host (host byte order), NULL for ICMP */
+  uint16_t *ports;
+
+  /** Number of host bytes */
+  uint16_t hosts_cnt;
+
+  /** The average response rate of recently responding hosts with this
+   * protocol (I.e. the A(E(b)) value from the paper) */
+  float aeb;
+
+} __attribute__((packed)) trinarkular_slash24_hosts_t;
 
 typedef struct trinarkular_slash24 {
 
   /** The network IP (first IP) of this /24 (in host byte order) */
   uint32_t network_ip;
 
-  /** List of target host bytes for this /24 (should be OR'd with the network
-      IP) */
-  uint8_t *hosts;
-
-  /** Number of host bytes */
-  uint16_t hosts_cnt;
-
-  /** The average response rate of recently responding hosts in this /24
-   * (I.e. the A(E(b)) value from the paper) */
-  float aeb;
+  /** Hosts per probe protocol (indexed by trinarkular_probe_proto_t); a
+      protocol with no hosts is not probed in this /24 */
+  trinarkular_slash24_hosts_t proto[TRINARKULAR_PROBE_PROTO_CNT];
 
   /** List of metadata */
   char **md;
@@ -203,6 +245,16 @@ void trinarkular_probelist_destroy(trinarkular_probelist_t *pl);
  * @return probelist version string
  */
 char *trinarkular_probelist_get_version(trinarkular_probelist_t *pl);
+
+/** Get the signals this probelist provides
+ *
+ * @param pl            pointer to the probelist
+ * @return mask of TRINARKULAR_SIGNAL_BIT() values: one bit per probe protocol
+ * with hosts in at least one /24, plus the combined signal if the probelist
+ * uses the multi-protocol format. A probelist in the original single-protocol
+ * format provides the ICMP signal only.
+ */
+uint8_t trinarkular_probelist_get_signals(trinarkular_probelist_t *pl);
 
 /** How many /24s are in this probelist?
  *
@@ -295,8 +347,17 @@ void *trinarkular_probelist_get_first_slash24_state(
 
 // Helper functions
 
+/** Get the next host of a /24 to probe with the given protocol
+ *
+ * @param s24           pointer to the /24
+ * @param state         pointer to the /24's state
+ * @param proto         probe protocol (must have hosts in this /24)
+ * @param[out] port     set to the host's destination port (0 for ICMP)
+ * @return host IP in host byte order
+ */
 uint32_t
 trinarkular_probelist_get_next_host(trinarkular_slash24_t *s24,
-                                    trinarkular_slash24_state_t *state);
+                                    trinarkular_slash24_state_t *state,
+                                    int proto, uint16_t *port);
 
 #endif /* __TRINARKULAR_PROBELIST_H */
